@@ -1,8 +1,15 @@
-# Knowledge Forge
+# Ingot
+
+![Version](https://img.shields.io/badge/Version-1.0-blue)
+![License](https://img.shields.io/badge/License-MIT-green)
+![Language](https://img.shields.io/badge/Language-中文-red)
+![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)
+![Vue](https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white)
+![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
 
 > 本地优先的 RAG + OCR + GraphRAG 知识库应用 —— 把散落的文档锻造成可追溯的知识网络。
 
-Knowledge Forge 是一个可直接在本机运行的全栈知识库应用，提供多知识库管理、常见办公文档解析、扫描件 OCR、向量化检索、二阶段重排、知识图谱构建、图社区摘要、四种检索模式、流式问答和证据回溯，全部数据保存在本地 SQLite。管理端使用 Vue 3 + TypeScript + Vite 构建，生产构建由 FastAPI 在同一个 localhost 端口托管。
+Ingot 是一个可直接在本机运行的全栈知识库应用，提供多知识库管理、常见办公文档解析、扫描件 OCR、向量化检索、二阶段重排、知识图谱构建、图社区摘要、四种检索模式、流式问答和证据回溯，全部数据保存在本地 SQLite。管理端使用 Vue 3 + TypeScript + Vite 构建，生产构建由 FastAPI 在同一个 localhost 端口托管。
 
 ## 核心能力
 

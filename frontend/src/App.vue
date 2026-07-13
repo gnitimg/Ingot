@@ -286,7 +286,7 @@ onBeforeUnmount(() => window.clearTimeout(graphPoll));
 <template>
   <div class="app-shell">
     <aside class="sidebar">
-      <div class="brand"><div class="brand-mark"><span /><span /><span /></div><div><strong>KNOWLEDGE</strong><small>FORGE / RAG STUDIO</small></div></div>
+      <div class="brand"><div class="brand-mark"><span /><span /><span /></div><div><strong>INGOT</strong><small>RAG STUDIO</small></div></div>
       <button class="button button-primary button-full" @click="openCreateModal"><span>＋</span> 新建知识库</button>
       <div class="sidebar-label">知识库</div>
       <nav class="kb-list">

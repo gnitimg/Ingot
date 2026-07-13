@@ -18,7 +18,7 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    app_name: str = "Knowledge Forge"
+    app_name: str = "Ingot"
     app_host: str = "127.0.0.1"
     app_port: int = Field(default=8000, ge=1, le=65535)
     data_dir: Path = Path("./data")

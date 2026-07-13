@@ -1,4 +1,4 @@
-"""Interactive first-run configuration for Knowledge Forge."""
+"""Interactive first-run configuration for Ingot."""
 
 from __future__ import annotations
 
@@ -74,7 +74,7 @@ def needs_configuration(path: Path = ENV_PATH) -> bool:
 
 def configure(path: Path = ENV_PATH) -> Path:
     current = read_env(path)
-    print("\nKnowledge Forge / 首次运行配置")
+    print("\nIngot / 首次运行配置")
     print("=" * 38)
     print("配置只会写入本机 .env；该文件已被 .gitignore 排除。\n")
 

@@ -12,7 +12,7 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
     with TestClient(main.app) as client:
         root = client.get("/")
         assert root.status_code == 200
-        assert "Knowledge Forge" in root.text
+        assert "Ingot" in root.text
 
         health = client.get("/api/health").json()
         assert health["status"] == "ok"

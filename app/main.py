@@ -34,7 +34,7 @@ async def lifespan(_: FastAPI):
 
 
 app = FastAPI(
-    title="Knowledge Forge API",
+    title="Ingot API",
     description="Local-first RAG + GraphRAG knowledge-base application",
     version="1.1.0",
     lifespan=lifespan,
