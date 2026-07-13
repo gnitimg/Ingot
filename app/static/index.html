@@ -1,0 +1,148 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="本地优先的 RAG 与 GraphRAG 知识库工作台">
+  <title>Knowledge Forge</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true"><span></span><span></span><span></span></div>
+        <div><strong>KNOWLEDGE</strong><small>FORGE / RAG STUDIO</small></div>
+      </div>
+      <button class="button button-primary button-full" id="new-kb-button"><span>＋</span> 新建知识库</button>
+      <div class="sidebar-label">知识库</div>
+      <nav class="kb-list" id="kb-list" aria-label="知识库列表"></nav>
+      <div class="sidebar-foot">
+        <div class="status-line"><span class="status-dot" id="api-status-dot"></span><span id="api-status-text">正在检查服务</span></div>
+        <div class="model-chip" id="model-chip">BAAI/bge-m3</div>
+      </div>
+    </aside>
+
+    <main class="main">
+      <section class="empty-state" id="empty-state">
+        <div class="empty-graphic" aria-hidden="true">
+          <div class="orbit orbit-one"></div><div class="orbit orbit-two"></div><div class="core">K</div>
+        </div>
+        <p class="eyebrow">RAG + GRAPHRAG KNOWLEDGE ENGINE</p>
+        <h1>把散落的文档，锻造成<br>可追溯的知识网络。</h1>
+        <p>创建一个知识库，导入资料，然后使用向量检索、图谱检索或混合检索开始对话。</p>
+        <button class="button button-primary" id="empty-create-button">创建第一个知识库 <span>→</span></button>
+      </section>
+
+      <section class="workspace hidden" id="workspace">
+        <header class="workspace-header">
+          <div>
+            <div class="eyebrow">KNOWLEDGE BASE / <span id="kb-updated">LOCAL</span></div>
+            <div class="title-row">
+              <h1 id="kb-title">知识库</h1>
+              <span class="graph-badge" id="graph-status-badge">图谱未构建</span>
+            </div>
+            <p id="kb-description">—</p>
+          </div>
+          <div class="header-actions">
+            <div class="stat"><strong id="stat-docs">0</strong><span>文档</span></div>
+            <div class="stat"><strong id="stat-chunks">0</strong><span>文本块</span></div>
+            <div class="stat"><strong id="stat-entities">0</strong><span>实体</span></div>
+            <button class="icon-button danger" id="delete-kb-button" title="删除知识库" aria-label="删除知识库">⌫</button>
+          </div>
+        </header>
+
+        <nav class="tabs" aria-label="工作区导航">
+          <button class="tab active" data-tab="documents"><span>01</span> 文档</button>
+          <button class="tab" data-tab="chat"><span>02</span> 问答</button>
+          <button class="tab" data-tab="graph"><span>03</span> 知识图谱</button>
+          <button class="tab" data-tab="settings"><span>04</span> 配置</button>
+        </nav>
+
+        <div class="tab-panels">
+          <section class="tab-panel active" id="panel-documents">
+            <div class="section-heading">
+              <div><p class="eyebrow">INGESTION PIPELINE</p><h2>构建知识底座</h2><p>上传后自动解析、切分并向量化。文档变化后请重新构建知识图谱。</p></div>
+              <button class="button button-secondary" id="build-graph-button"><span class="button-icon">⌘</span> 构建 GraphRAG</button>
+            </div>
+            <div class="upload-zone" id="upload-zone" tabindex="0" role="button" aria-label="上传文档">
+              <input type="file" id="file-input" multiple accept=".txt,.md,.markdown,.pdf,.docx,.pptx,.xlsx,.csv,.json,.html,.htm,.png,.jpg,.jpeg,.webp,.bmp,.tif,.tiff" hidden>
+              <div class="upload-icon">↥</div>
+              <div><strong>拖放文档或扫描图片到这里</strong><p>自动判断是否需要 OCR · 单文件最大 <span id="max-upload">50</span> MB</p></div>
+              <div class="format-list"><span>PDF</span><span>DOCX</span><span>PPTX</span><span>XLSX</span><span>IMAGE/OCR</span></div>
+            </div>
+            <div class="upload-progress hidden" id="upload-progress"><div><span id="upload-progress-label">正在处理文档…</span><strong id="upload-progress-value">0%</strong></div><div class="progress-track"><span></span></div></div>
+            <div class="document-section">
+              <div class="list-heading"><h3>已导入文档</h3><span id="document-count-label">0 个文件</span></div>
+              <div class="document-list" id="document-list"></div>
+            </div>
+          </section>
+
+          <section class="tab-panel chat-panel" id="panel-chat">
+            <div class="chat-main">
+              <div class="chat-toolbar">
+                <div><p class="eyebrow">GROUNDED CONVERSATION</p><h2>知识问答</h2></div>
+                <label class="select-wrap">检索模式
+                  <select id="retrieval-mode">
+                    <option value="hybrid">混合检索</option>
+                    <option value="vector">向量检索</option>
+                    <option value="graph_local">图谱局部检索</option>
+                    <option value="graph_global">图谱全局检索</option>
+                  </select>
+                </label>
+              </div>
+              <div class="messages" id="messages">
+                <div class="chat-welcome">
+                  <span class="welcome-index">A/01</span>
+                  <h3>向你的知识库提问</h3>
+                  <p>回答会附带文本来源或图谱证据。混合检索适合大多数问题，全局图谱适合跨文档主题总结。</p>
+                  <div class="prompt-suggestions">
+                    <button>总结知识库中的核心主题</button><button>有哪些关键实体及其关系？</button><button>比较文档中的主要观点</button>
+                  </div>
+                </div>
+              </div>
+              <form class="chat-composer" id="chat-form">
+                <textarea id="chat-input" rows="1" maxlength="4000" placeholder="输入问题，Enter 发送，Shift + Enter 换行…"></textarea>
+                <button class="send-button" type="submit" id="send-button" aria-label="发送">↑</button>
+              </form>
+            </div>
+            <aside class="evidence-panel">
+              <div class="evidence-head"><span>检索证据</span><small id="evidence-count">0 ITEMS</small></div>
+              <div id="evidence-list" class="evidence-list"><div class="evidence-empty">提问后，这里会展示模型使用的原始证据。</div></div>
+            </aside>
+          </section>
+
+          <section class="tab-panel" id="panel-graph">
+            <div class="graph-toolbar">
+              <div><p class="eyebrow">ENTITY RELATIONSHIP MAP</p><h2>知识图谱</h2><p id="graph-summary">尚未构建图谱</p></div>
+              <div class="graph-actions"><label class="search-box">⌕<input id="graph-search" placeholder="查找实体"></label><button class="button button-secondary" id="refresh-graph-button">刷新</button></div>
+            </div>
+            <div class="graph-layout">
+              <div class="graph-canvas-wrap"><canvas id="graph-canvas"></canvas><div class="graph-empty" id="graph-empty"><strong>尚无图谱数据</strong><span>导入文档后点击「构建 GraphRAG」</span></div><div class="graph-legend" id="graph-legend"></div><div class="node-tooltip hidden" id="node-tooltip"></div></div>
+              <aside class="community-panel"><div class="evidence-head"><span>图社区</span><small>GLOBAL INDEX</small></div><div id="community-list" class="community-list"></div></aside>
+            </div>
+          </section>
+
+          <section class="tab-panel" id="panel-settings">
+            <div class="section-heading"><div><p class="eyebrow">RUNTIME CONFIGURATION</p><h2>运行配置</h2><p>配置从本地 <code>.env</code> 读取。为保护密钥，此页面不会显示 API Key。</p></div></div>
+            <div class="settings-grid" id="settings-grid"></div>
+          </section>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <dialog class="modal" id="kb-modal">
+    <form method="dialog" id="kb-form">
+      <div class="modal-top"><span class="eyebrow">NEW KNOWLEDGE BASE</span><button value="cancel" aria-label="关闭">×</button></div>
+      <h2>创建知识库</h2>
+      <label>名称<input name="name" id="kb-name-input" maxlength="80" required placeholder="例如：产品技术文档"></label>
+      <label>描述（可选）<textarea name="description" maxlength="500" rows="3" placeholder="这个知识库将用于什么？"></textarea></label>
+      <div class="modal-actions"><button class="button button-ghost" value="cancel">取消</button><button class="button button-primary" value="default" id="create-kb-submit">创建知识库</button></div>
+    </form>
+  </dialog>
+
+  <div class="toast-container" id="toast-container" aria-live="polite"></div>
+  <script src="/static/app.js" defer></script>
+</body>
+</html>
