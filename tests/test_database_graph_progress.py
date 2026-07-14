@@ -33,7 +33,6 @@ def test_graph_progress_and_interrupted_build_recovery(tmp_path):
     database.initialize()
     recovered = database.get_knowledge_base(kb_id)
     assert recovered is not None
-    assert recovered["graph_status"] == "error"
-    assert recovered["graph_stage"] == "interrupted"
+    assert recovered["graph_status"] == "paused"
+    assert recovered["graph_stage"] == "extracting"
     assert "服务重启" in recovered["graph_error"]
-

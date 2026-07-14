@@ -48,6 +48,18 @@ class SlowGraphAI(FakeGraphAI):
         return await super().chat_complete(messages, **kwargs)
 
 
+class PauseAfterFirstChunkAI(FakeGraphAI):
+    def __init__(self):
+        self.extraction_calls = 0
+
+    async def chat_complete(self, messages, **kwargs):
+        if len(messages) > 1:
+            self.extraction_calls += 1
+            if self.extraction_calls > 1:
+                await asyncio.sleep(0.2)
+        return await super().chat_complete(messages, **kwargs)
+
+
 def graph_fixture(tmp_path, chunk_count=2):
     settings = Settings(
         _env_file=None,
@@ -109,4 +121,30 @@ def test_rebuild_stops_when_every_chunk_times_out(tmp_path):
     assert knowledge_base["graph_stage"] == "failed"
     assert knowledge_base["graph_failed_chunks"] == 1
     assert "所有图谱抽取请求均失败" in knowledge_base["graph_error"]
+
+
+def test_total_timeout_pauses_and_resume_uses_checkpoint(tmp_path):
+    settings, database, kb_id = graph_fixture(tmp_path, chunk_count=2)
+    settings.graph_concurrency = 1
+    settings.graph_build_timeout = 0.05
+    service = GraphRAGService(database, PauseAfterFirstChunkAI(), settings)
+
+    asyncio.run(service.rebuild(kb_id))
+
+    paused = database.get_knowledge_base(kb_id)
+    checkpoint = database.graph_checkpoint_stats(kb_id)
+    assert paused is not None
+    assert paused["graph_status"] == "paused"
+    assert checkpoint == {"total": 2, "processed": 1, "succeeded": 1, "failed": 0}
+    assert len(database.pending_graph_chunks(kb_id)) == 1
+
+    service.ai = FakeGraphAI()
+    settings.graph_build_timeout = 60
+    asyncio.run(service.rebuild(kb_id, resume=True))
+
+    completed = database.get_knowledge_base(kb_id)
+    assert completed is not None
+    assert completed["graph_status"] == "ready"
+    assert completed["entity_count"] == 2
+    assert database.graph_checkpoint_stats(kb_id)["total"] == 0
 

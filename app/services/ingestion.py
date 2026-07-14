@@ -102,7 +102,10 @@ class IngestionService:
                 ocr_page_count=ocr_count,
                 warning="；".join(warnings)[:1000] or None,
             )
-            self.db.set_graph_status(kb_id, "stale")
+            self.db.invalidate_graph(
+                kb_id,
+                "文档发生变更，原图谱已清空；下次构建将从零开始",
+            )
             self.db.touch_knowledge_base(kb_id)
             return {
                 "id": document_id,

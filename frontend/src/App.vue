@@ -60,6 +60,8 @@ const graphStageLabels: Record<string, string> = {
   embedding: "生成社区向量",
   completed: "图谱已构建",
   interrupted: "构建已中断",
+  invalidated: "等待重新构建",
+  stopped: "构建已停止",
   failed: "构建失败",
 };
 const tabs: Array<{ key: TabName; label: string; index: string }> = [
@@ -84,7 +86,8 @@ const graphInfo = computed(() => {
   if (status === "building") return [graphProgressLabel(current.value), "building"] as [string, string];
   return ({
     empty: ["图谱未构建", ""], stale: ["图谱待更新", ""], building: ["图谱构建中", "building"],
-    ready: ["图谱已就绪", "ready"], error: ["图谱构建失败", "error"],
+    paused: ["图谱构建已暂停", "paused"], ready: ["图谱已就绪", "ready"],
+    error: ["图谱构建失败", "error"],
   } satisfies Record<GraphStatus, [string, string]>)[status];
 });
 
@@ -433,11 +436,22 @@ async function buildGraph() {
   } catch (error) { notify((error as Error).message, "error"); }
 }
 
-async function cancelGraph() {
-  if (!current.value || !window.confirm("确定停止当前 GraphRAG 构建吗？已生成的部分图数据不会标记为可用。")) return;
+async function resumeGraph() {
+  if (!current.value) return;
+  try {
+    await api(`/api/knowledge-bases/${current.value.id}/graph/resume`, { method: "POST" });
+    current.value.graph_status = "building";
+    notify("GraphRAG 已从检查点继续构建");
+    scheduleAutoRefresh(250);
+  } catch (error) { notify((error as Error).message, "error"); }
+}
+
+async function stopGraph() {
+  if (!current.value || !window.confirm("确定停止当前 GraphRAG 构建吗？部分结果与检查点会被清空，下次构建将从零开始。")) return;
   try {
     await api(`/api/knowledge-bases/${current.value.id}/graph/cancel`, { method: "POST" });
-    notify("正在停止 GraphRAG 构建");
+    await refreshCurrent();
+    notify("GraphRAG 构建已停止；下次将从零开始");
     scheduleAutoRefresh(250);
   } catch (error) { notify((error as Error).message, "error"); }
 }
@@ -518,6 +532,9 @@ async function syncWorkspace() {
       }
       if (kb.graph_status === "error") {
         notify(`图谱构建失败：${kb.graph_error || "未知错误"}`, "error");
+      }
+      if (kb.graph_status === "paused") {
+        notify(kb.graph_error || "图谱构建已暂停，可继续构建");
       }
     } else if (activeTab.value === "graph" && (statusChanged || graphChanged)) {
       await loadGraph();
@@ -727,7 +744,7 @@ onBeforeUnmount(() => {
                 <span>01 / INGEST</span><strong>{{ current.document_count ? `管理 ${current.document_count} 份资料` : "导入第一批资料" }}</strong><p>上传 PDF、Office 文档、Markdown 或扫描图片，自动解析、OCR、切分并建立向量索引。</p><b>前往文档 →</b>
               </button>
               <button class="guidance-card" @click="activeTab = current.graph_status === 'ready' ? 'graph' : 'documents'">
-                <span>02 / GRAPHRAG</span><strong>{{ current.graph_status === "building" ? graphProgressLabel(current) : current.graph_status === "ready" ? "浏览实体关系" : current.graph_status === "error" ? "检查并重新构建" : "构建知识图谱" }}</strong><p>从文本块提取实体与关系，形成可缩放、可拖动的关系网络和全局主题社区。</p><b>{{ current.graph_status === "ready" ? "打开图谱" : "查看构建入口" }} →</b>
+                <span>02 / GRAPHRAG</span><strong>{{ current.graph_status === "building" ? graphProgressLabel(current) : current.graph_status === "paused" ? "继续构建知识图谱" : current.graph_status === "ready" ? "浏览实体关系" : current.graph_status === "error" ? "检查并重新构建" : "构建知识图谱" }}</strong><p>从文本块提取实体与关系，形成可缩放、可拖动的关系网络和全局主题社区。</p><b>{{ current.graph_status === "ready" ? "打开图谱" : "查看构建入口" }} →</b>
               </button>
               <button class="guidance-card" @click="activeTab = current.chunk_count ? 'chat' : 'documents'">
                 <span>03 / ASK</span><strong>基于证据开始问答</strong><p>使用向量、图谱局部、图谱全局或混合检索；回答会附带命中的原文与关系证据。</p><b>{{ current.chunk_count ? "开始提问" : "先导入资料" }} →</b>
@@ -740,10 +757,12 @@ onBeforeUnmount(() => {
         </section>
 
         <section v-show="activeTab === 'documents'" id="panel-documents" class="tab-panel" :class="{ active: activeTab === 'documents' }">
-          <div class="section-heading"><div><p class="eyebrow">INGESTION PIPELINE</p><h2>构建知识底座</h2><p>原生文本优先；图片和低文本密度 PDF 页面自动进入 OCR，再执行切分、向量化与索引。</p></div><button class="button button-secondary" :class="{ 'button-stop': current.graph_status === 'building' }" :disabled="!current.chunk_count" @click="current.graph_status === 'building' ? cancelGraph() : buildGraph()"><span class="button-icon">⌘</span>{{ current.graph_status === "building" ? "停止构建" : "构建 GraphRAG" }}</button></div>
+          <div class="section-heading"><div><p class="eyebrow">INGESTION PIPELINE</p><h2>构建知识底座</h2><p>原生文本优先；图片和低文本密度 PDF 页面自动进入 OCR，再执行切分、向量化与索引。</p></div><div class="graph-build-actions"><button v-if="current.graph_status === 'building' || current.graph_status === 'paused'" class="button button-ghost button-stop" @click="stopGraph"><span class="button-icon">■</span>停止构建</button><button class="button button-secondary" :disabled="!current.chunk_count || current.graph_status === 'building'" @click="current.graph_status === 'paused' ? resumeGraph() : buildGraph()"><span class="button-icon">{{ current.graph_status === "paused" ? "↻" : "⌘" }}</span>{{ current.graph_status === "building" ? "正在构建…" : current.graph_status === "paused" ? "继续构建" : "构建 GraphRAG" }}</button></div></div>
           <div class="pipeline-strip"><span><i>01</i> 文档解析</span><b>→</b><span><i>02</i> OCR fallback</span><b>→</b><span><i>03</i> Chunk + Embed</span><b>→</b><span><i>04</i> Rerank / Graph</span></div>
           <div v-if="current.graph_status === 'error'" class="graph-build-alert"><strong>上次图谱构建未完成</strong><span>{{ current.graph_error || "未知错误，可重新发起构建。" }}</span></div>
-          <div v-if="current.graph_status === 'building'" class="graph-build-progress" role="progressbar" :aria-valuenow="graphProgressPercent" aria-valuemin="0" aria-valuemax="100">
+          <div v-else-if="current.graph_status === 'paused'" class="graph-build-alert graph-build-paused"><strong>图谱构建已暂停</strong><span>{{ current.graph_error || "已完成结果与检查点均已保留，可调整配置后继续构建。" }}</span></div>
+          <div v-else-if="current.graph_status === 'stale' && current.graph_error" class="graph-build-alert graph-build-stale"><strong>图谱需要重新构建</strong><span>{{ current.graph_error }}</span></div>
+          <div v-if="current.graph_status === 'building' || current.graph_status === 'paused'" class="graph-build-progress" :class="{ paused: current.graph_status === 'paused' }" role="progressbar" :aria-valuenow="graphProgressPercent" aria-valuemin="0" aria-valuemax="100">
             <div><strong>{{ graphProgressLabel(current) }}</strong><span>{{ graphProgressPercent }}%</span></div>
             <p v-if="current.graph_failed_chunks">{{ current.graph_failed_chunks }} 个文本块抽取失败，任务会继续处理其余内容。</p>
             <div class="graph-progress-track"><span :style="{ width: `${graphProgressPercent}%` }" /></div>
@@ -868,7 +887,7 @@ onBeforeUnmount(() => {
               <article class="setting-card setting-card-form setting-card-compact" data-settings-section="graph" :class="{ editing: editingSettingsSection === 'graph' }" @pointerdown="beginSettingsEdit('graph')">
                 <div class="setting-card-head"><div><strong>GraphRAG</strong><small>实体关系抽取与社区构建</small></div><i class="config-status" /></div>
                 <div class="config-fields">
-                  <label class="config-field"><span>抽取并发 <small>下次构建生效</small></span><input v-model.number="settingsForm.graph.concurrency" type="number" min="1" max="10" required><small>建议从 3–5 开始；过高可能触发提供商限流</small></label>
+                  <label class="config-field"><span>模型请求并发 <small>下次构建/继续时生效</small></span><input v-model.number="settingsForm.graph.concurrency" type="number" min="1" max="10" required><small>同时作用于实体关系抽取和社区摘要；建议 3–5，过高可能触发提供商限流</small></label>
                   <label class="config-field"><span>最大文本块</span><input v-model.number="settingsForm.graph.max_chunks" type="number" min="0" required><small>0 表示不限</small></label>
                   <label class="config-field"><span>单块超时（秒）</span><input v-model.number="settingsForm.graph.chunk_timeout" type="number" min="15" max="1800" required></label>
                   <label class="config-field"><span>总任务超时（秒）</span><input v-model.number="settingsForm.graph.build_timeout" type="number" min="60" max="86400" required></label>

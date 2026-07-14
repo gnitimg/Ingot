@@ -95,7 +95,7 @@ python run.py
 
 进入任一知识库的 **配置** 页，可以直接编辑 Embedding、Chat / Graph、OCR、Reranker 的提供商地址、模型、API Key 和超时/并发参数，也可以调整 Chunking 与 GraphRAG。六张配置卡片均采用显式提交：点击卡片后进入编辑态，只有点击卡片内的“保存”才会提交最新值；未保存时点击卡片外部，会立即恢复该卡片最后一次已保存的值。顶部“保存并应用”仍可明确提交全部配置，“撤销未保存”则恢复全部卡片。配置卡片使用自适应瀑布流排列，卡片高度随内容收口。保存后会原子写入 `.env` 并热更新当前进程，无需重启。API Key 使用密码输入，已有值不会回显，输入框留空会保留原密钥；Chat、OCR 与 Reranker 也可选择复用 Embedding 的地址和 Key。
 
-GraphRAG 的“抽取并发”也可直接在浏览器中设置（范围 1–10，建议先用 3–5）。保存后从**下一次**图谱构建开始生效；正在执行的任务会继续使用启动时的并发数。
+GraphRAG 的“模型请求并发”也可直接在浏览器中设置（范围 1–10，建议先用 3–5），同时作用于**实体关系抽取**和**图社区摘要**。保存后从下一次新建或继续构建开始生效；正在执行的这一轮仍使用启动时的并发数。提高并发只会缩短可并行的模型请求，无法缩短单次响应，并且过高时可能触发提供商限流与重试，反而变慢。
 
 也可以直接使用 Uvicorn：
 
@@ -113,7 +113,7 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 2. **查看知识库首页** — 每个知识库都有独立首页，集中显示名称、描述、图谱状态、文档/文本块/实体/关系/社区统计，以及文档、GraphRAG、问答和配置的常用引导
 3. **导入文档** — 拖放或点击上传区选择文件，支持批量上传
 4. **等待索引** — 后端自动执行：文档解析 → OCR（如需要）→ 文本切分 → 向量化 → SQLite 存储
-5. **构建 GraphRAG**（可选）— 在文档页点击"构建 GraphRAG"，页面会实时显示实体关系抽取、社区摘要和社区向量三个阶段的进度；也可主动停止任务
+5. **构建 GraphRAG**（可选）— 在文档页点击"构建 GraphRAG"，页面会实时显示实体关系抽取、社区摘要和社区向量三个阶段的进度；达到总任务超时后会暂停并保留检查点，可调整配置后继续；主动停止则清空部分结果并从零开始
 6. **开始问答** — 在问答页选择检索模式，输入问题，查看带证据的流式回答；模型返回的 Markdown 会安全渲染为标题、列表、表格、引用和代码块
 
 管理端会为每份文档显示解析方式（原生文本 / OCR / 混合）、OCR 页数、解析警告和索引状态。
@@ -130,11 +130,17 @@ uvicorn app.main:app --host 127.0.0.1 --port 8000
 
 ```
 empty → stale（文档变更后）→ building → ready
+                                 ↓  ↑
+                              paused（可继续）
                                  ↓
-                              error（可重试）
+                         stop → stale（从零重建）
+
+任意阶段的不可恢复错误 → error（从零重试）
 ```
 
-新增或删除文档后，图谱标记为"待更新"；向量检索仍然可用，GraphRAG 需要重新构建。构建期间知识库接口会返回 `graph_stage`、`graph_progress_current`、`graph_progress_total`、`graph_failed_chunks` 和心跳时间。单块请求或总任务超过配置上限时会自动进入 `error`，服务重启也会把未完成任务收口为可重试错误，不会永久停留在 `building`。
+每个文本块完成抽取后都会写入持久化检查点。总任务达到 `GRAPH_BUILD_TIMEOUT` 时进入 `paused`，已经完成的实体、关系和文本块检查点会保留；点击“继续构建”只处理尚未完成的文本块，社区摘要阶段则基于已完成实体图安全重放。服务重启也会把运行中的任务转换为可继续状态，不会永久停留在 `building`。
+
+点击“停止构建”会清除部分图谱和检查点，下次从零构建。新增或删除文档会改变图谱输入，因此同样会安全取消当前任务、清空旧图谱与检查点，并标记为“待更新”；向量检索仍然可用。构建期间知识库接口会返回 `graph_stage`、`graph_progress_current`、`graph_progress_total`、`graph_failed_chunks` 和心跳时间。单个文本块持续失败仍会记录为失败块；只有所有文本块均失败等不可恢复情况才进入 `error`。
 
 ## 检索模式详解
 
@@ -215,11 +221,11 @@ empty → stale（文档变更后）→ building → ready
 
 **GraphRAG 构建：**
 1. 从 chunks 表读取所有已索引文本块（可选 `GRAPH_MAX_CHUNKS` 限制）
-2. 按 `GRAPH_CONCURRENCY` 分批并发调用 Chat 模型抽取实体和关系（JSON 模式，失败自动降级），每批回写进度和心跳
+2. 按 `GRAPH_CONCURRENCY` 分批并发调用 Chat 模型抽取实体和关系（JSON 模式，失败自动降级），每批以事务方式写入图数据与文本块检查点
 3. 同名实体自动合并（大小写不敏感归一化），关系取最大权重
 4. 标签传播算法发现图社区（12 轮迭代）
-5. 每个社区调用 Chat 模型生成主题摘要
-6. 摘要向量化后存入 communities 表；单块与整次构建分别受超时上限保护
+5. 按同一 `GRAPH_CONCURRENCY` 并发调用 Chat 模型生成社区主题摘要
+6. 摘要向量化后存入 communities 表；单块失败可继续，总任务超时会暂停并允许从检查点恢复
 
 ### 流式问答
 
@@ -426,10 +432,10 @@ git check-ignore .env
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `GRAPH_CONCURRENCY` | `3` | 图谱抽取并发请求数 |
+| `GRAPH_CONCURRENCY` | `3` | 实体关系抽取与社区摘要的模型请求并发数 |
 | `GRAPH_MAX_CHUNKS` | `0` | 参与建图的最大块数；`0` 表示不限 |
 | `GRAPH_CHUNK_TIMEOUT` | `240` | 单个文本块抽取的总等待上限（秒，包含 JSON 降级重试） |
-| `GRAPH_BUILD_TIMEOUT` | `3600` | 一次完整 GraphRAG 构建的总等待上限（秒） |
+| `GRAPH_BUILD_TIMEOUT` | `3600` | 单轮 GraphRAG 构建的等待上限（秒）；到达后暂停，可继续下一轮 |
 
 **应用与存储：**
 
@@ -475,7 +481,8 @@ git check-ignore .env
 | 方法 | 路径 | 说明 |
 |---|---|---|
 | `POST` | `/api/knowledge-bases/{id}/graph/rebuild` | 后台重建 GraphRAG（返回 202） |
-| `POST` | `/api/knowledge-bases/{id}/graph/cancel` | 停止当前 GraphRAG 构建（返回 202） |
+| `POST` | `/api/knowledge-bases/{id}/graph/resume` | 从持久化检查点继续暂停的构建（返回 202） |
+| `POST` | `/api/knowledge-bases/{id}/graph/cancel` | 停止构建并清空部分图谱与检查点（返回 202） |
 | `GET` | `/api/knowledge-bases/{id}/graph` | 获取实体、关系和社区（`?limit=500`） |
 
 ### 系统
@@ -501,10 +508,10 @@ cd frontend && npm run typecheck && npm run build
 | 测试文件 | 覆盖内容 |
 |---|---|
 | `test_database.py` | SQLite 级联删除、图谱数据查询、列迁移兼容 |
-| `test_database_graph_progress.py` | 图谱进度、心跳字段与中断任务恢复迁移 |
+| `test_database_graph_progress.py` | 图谱进度、心跳字段与中断任务暂停恢复迁移 |
 | `test_api.py` | FastAPI 生命周期、知识库 CRUD、图谱启动/停止、配置热更新与密钥不回显 |
 | `test_chunker.py` | 文本切分大小限制、元数据传递、overlap 校验 |
-| `test_graph_rag.py` | Markdown 围栏 JSON 解析、实体归一化、社区发现、进度完成与单块超时收口 |
+| `test_graph_rag.py` | Markdown 围栏 JSON 解析、实体归一化、社区发现、进度完成、单块超时与总超时检查点恢复 |
 | `test_ocr.py` | 图片 OCR 预处理（EXIF + PNG）、元数据保留、未配置回退 |
 | `test_ai_client.py` | Reranker 响应解析、无效索引过滤 |
 | `test_init.py` | `.env` 原子更新、配置检查、旧数据库迁移与端口预检 |
@@ -516,9 +523,9 @@ OCR 和 GraphRAG 都会产生额外模型调用。以下参数可以控制吞吐
 - **`OCR_MAX_PAGES`** — 限制单文档最大 OCR 页数（默认 100）
 - **`OCR_CONCURRENCY`** — 控制 OCR 并发数（默认 2）
 - **`GRAPH_MAX_CHUNKS`** — 限制参与建图的文本块数（默认 0 = 不限）
-- **`GRAPH_CONCURRENCY`** — 控制图谱抽取并发数（默认 3）
+- **`GRAPH_CONCURRENCY`** — 控制实体关系抽取和社区摘要并发数（默认 3；过高可能触发限流与重试）
 - **`GRAPH_CHUNK_TIMEOUT`** — 防止单个模型请求或降级重试长期占住构建槽位（默认 240 秒）
-- **`GRAPH_BUILD_TIMEOUT`** — 防止整次后台任务无限运行（默认 3600 秒）
+- **`GRAPH_BUILD_TIMEOUT`** — 防止单轮后台任务无限运行；到达后暂停而不是丢弃进度（默认 3600 秒）
 
 建议首次建图时设置 `GRAPH_MAX_CHUNKS=100`，确认效果后再改为 `0` 构建完整图谱。
 

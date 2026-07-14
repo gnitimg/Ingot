@@ -80,6 +80,19 @@ CREATE TABLE IF NOT EXISTS chunks (
 CREATE INDEX IF NOT EXISTS idx_chunks_kb ON chunks(kb_id);
 CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id);
 
+CREATE TABLE IF NOT EXISTS graph_build_chunks (
+    kb_id TEXT NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    chunk_id TEXT NOT NULL REFERENCES chunks(id) ON DELETE CASCADE,
+    position INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    error TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY(kb_id, chunk_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_graph_build_chunks_pending
+ON graph_build_chunks(kb_id, status, position);
+
 CREATE TABLE IF NOT EXISTS entities (
     id TEXT PRIMARY KEY,
     kb_id TEXT NOT NULL REFERENCES knowledge_bases(id) ON DELETE CASCADE,
@@ -195,8 +208,10 @@ class Database:
             now = utc_now()
             connection.execute(
                 """UPDATE knowledge_bases
-                   SET graph_status = 'error', graph_error = '服务重启导致构建中断，请重新构建',
-                       graph_stage = 'interrupted', graph_heartbeat_at = ?, updated_at = ?
+                   SET graph_status = 'paused',
+                       graph_error = '服务重启导致图谱构建暂停，可从当前检查点继续',
+                       graph_stage = CASE WHEN graph_stage = '' THEN 'interrupted' ELSE graph_stage END,
+                       graph_heartbeat_at = ?, updated_at = ?
                    WHERE graph_status = 'building'""",
                 (now, now),
             )
@@ -288,6 +303,72 @@ class Database:
                WHERE id = ?""",
             (max(0, total), now, now, now, kb_id),
         )
+
+    def prepare_graph_checkpoints(self, kb_id: str, chunk_ids: Sequence[str]) -> None:
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute("DELETE FROM graph_build_chunks WHERE kb_id = ?", (kb_id,))
+            connection.executemany(
+                """INSERT INTO graph_build_chunks
+                   (kb_id, chunk_id, position, status, error, updated_at)
+                   VALUES (?, ?, ?, 'pending', NULL, ?)""",
+                [
+                    (kb_id, chunk_id, position, now)
+                    for position, chunk_id in enumerate(chunk_ids)
+                ],
+            )
+
+    def graph_checkpoint_stats(self, kb_id: str) -> dict[str, int]:
+        row = self.fetch_one(
+            """SELECT COUNT(*) AS total,
+                      SUM(CASE WHEN status != 'pending' THEN 1 ELSE 0 END) AS processed,
+                      SUM(CASE WHEN status = 'succeeded' THEN 1 ELSE 0 END) AS succeeded,
+                      SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed
+               FROM graph_build_chunks WHERE kb_id = ?""",
+            (kb_id,),
+        ) or {}
+        return {
+            key: int(row.get(key) or 0)
+            for key in ("total", "processed", "succeeded", "failed")
+        }
+
+    def pending_graph_chunks(self, kb_id: str) -> list[dict[str, Any]]:
+        return self.fetch_all(
+            """SELECT c.id, c.content, c.chunk_index, d.filename
+               FROM graph_build_chunks checkpoint
+               JOIN chunks c ON c.id = checkpoint.chunk_id
+               JOIN documents d ON d.id = c.document_id
+               WHERE checkpoint.kb_id = ? AND checkpoint.status = 'pending'
+                 AND d.status = 'ready'
+               ORDER BY checkpoint.position""",
+            (kb_id,),
+        )
+
+    def resume_graph_build(self, kb_id: str) -> None:
+        now = utc_now()
+        self.execute(
+            """UPDATE knowledge_bases
+               SET graph_status = 'building', graph_error = NULL,
+                   graph_stage = CASE WHEN graph_stage = '' THEN 'queued' ELSE graph_stage END,
+                   graph_started_at = COALESCE(graph_started_at, ?),
+                   graph_heartbeat_at = ?, updated_at = ?
+               WHERE id = ?""",
+            (now, now, now, kb_id),
+        )
+
+    def pause_graph_build(self, kb_id: str, reason: str) -> None:
+        now = utc_now()
+        self.execute(
+            """UPDATE knowledge_bases
+               SET graph_status = 'paused', graph_error = ?,
+                   graph_stage = CASE WHEN graph_stage = '' THEN 'interrupted' ELSE graph_stage END,
+                   graph_heartbeat_at = ?, updated_at = ?
+               WHERE id = ?""",
+            (reason[:1000], now, now, kb_id),
+        )
+
+    def clear_graph_checkpoints(self, kb_id: str) -> None:
+        self.execute("DELETE FROM graph_build_chunks WHERE kb_id = ?", (kb_id,))
 
     def update_graph_progress(
         self,
@@ -399,7 +480,7 @@ class Database:
         if not row:
             return None
         self.execute("DELETE FROM documents WHERE id = ? AND kb_id = ?", (document_id, kb_id))
-        self.set_graph_status(kb_id, "stale")
+        self.invalidate_graph(kb_id, "文档已删除，原图谱已清空；下次构建将从零开始")
         return str(row["stored_path"])
 
     def chunks_for_search(self, kb_id: str) -> list[dict[str, Any]]:
@@ -442,6 +523,31 @@ class Database:
             connection.execute("DELETE FROM communities WHERE kb_id = ?", (kb_id,))
             connection.execute("DELETE FROM relationships WHERE kb_id = ?", (kb_id,))
             connection.execute("DELETE FROM entities WHERE kb_id = ?", (kb_id,))
+
+    def clear_communities(self, kb_id: str) -> None:
+        self.execute("DELETE FROM communities WHERE kb_id = ?", (kb_id,))
+
+    def invalidate_graph(self, kb_id: str, reason: str, *, stage: str = "invalidated") -> None:
+        now = utc_now()
+        with self.connection() as connection:
+            connection.execute("DELETE FROM communities WHERE kb_id = ?", (kb_id,))
+            connection.execute("DELETE FROM relationships WHERE kb_id = ?", (kb_id,))
+            connection.execute("DELETE FROM entities WHERE kb_id = ?", (kb_id,))
+            connection.execute("DELETE FROM graph_build_chunks WHERE kb_id = ?", (kb_id,))
+            chunk_count = int(
+                connection.execute(
+                    "SELECT COUNT(*) FROM chunks WHERE kb_id = ?", (kb_id,)
+                ).fetchone()[0]
+            )
+            connection.execute(
+                """UPDATE knowledge_bases
+                   SET graph_status = ?, graph_error = ?, graph_stage = ?,
+                       graph_progress_current = 0, graph_progress_total = 0,
+                       graph_failed_chunks = 0, graph_started_at = NULL,
+                       graph_heartbeat_at = NULL, updated_at = ?
+                   WHERE id = ?""",
+                ("stale" if chunk_count else "empty", reason[:1000], stage, now, kb_id),
+            )
 
     def graph_data(self, kb_id: str, limit: int = 500) -> dict[str, list[dict[str, Any]]]:
         entities = self.fetch_all(

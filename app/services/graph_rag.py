@@ -177,6 +177,18 @@ class GraphRAGService:
                             utc_now(),
                         ),
                     )
+                connection.execute(
+                    """UPDATE graph_build_chunks
+                       SET status = ?, error = ?, updated_at = ?
+                       WHERE kb_id = ? AND chunk_id = ?""",
+                    (
+                        str(extraction.get("_checkpoint_status", "succeeded")),
+                        str(extraction.get("_checkpoint_error") or "")[:1000] or None,
+                        utc_now(),
+                        kb_id,
+                        chunk_id,
+                    ),
+                )
 
     @staticmethod
     def _detect_communities(entity_ids: list[str], relations: list[dict[str, Any]]) -> list[list[str]]:
@@ -248,6 +260,9 @@ class GraphRAGService:
             return fallback_title[:80], fallback_summary[:2000]
 
     async def _build_communities(self, kb_id: str, failed_chunks: int) -> None:
+        # A paused community/embedding stage is replayed from the completed entity graph.
+        # Clearing here makes that replay idempotent and avoids duplicate communities.
+        self.db.clear_communities(kb_id)
         entities = self.db.fetch_all(
             "SELECT id, name, entity_type, description FROM entities WHERE kb_id = ?", (kb_id,)
         )
@@ -275,8 +290,8 @@ class GraphRAGService:
             failed_chunks=failed_chunks,
         )
         entity_map = {entity["id"]: entity for entity in entities}
-        summaries: list[tuple[list[str], str, str]] = []
-        for index, member_ids in enumerate(communities, start=1):
+        jobs: list[tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]] = []
+        for member_ids in communities:
             members = [entity_map[entity_id] for entity_id in member_ids]
             member_set = set(member_ids)
             internal_relations = [
@@ -284,12 +299,26 @@ class GraphRAGService:
                 for relation in relations
                 if relation["source_id"] in member_set and relation["target_id"] in member_set
             ]
-            title, summary = await self._summarize_community(members, internal_relations)
-            summaries.append((member_ids, title, summary))
+            jobs.append((member_ids, members, internal_relations))
+
+        summaries: list[tuple[list[str], str, str]] = []
+        batch_size = max(1, self.settings.graph_concurrency)
+        for start in range(0, len(jobs), batch_size):
+            batch = jobs[start : start + batch_size]
+            results = await asyncio.gather(
+                *(
+                    self._summarize_community(members, internal_relations)
+                    for _, members, internal_relations in batch
+                )
+            )
+            summaries.extend(
+                (member_ids, title, summary)
+                for (member_ids, _, _), (title, summary) in zip(batch, results, strict=True)
+            )
             self.db.update_graph_progress(
                 kb_id,
                 stage="communities",
-                current=index,
+                current=min(start + len(batch), len(jobs)),
                 total=len(communities),
                 failed_chunks=failed_chunks,
             )
@@ -335,14 +364,18 @@ class GraphRAGService:
         )
 
     async def _rebuild_pipeline(self, kb_id: str, chunks: list[dict[str, Any]]) -> None:
-        self.db.clear_graph(kb_id)
         semaphore = asyncio.Semaphore(self.settings.graph_concurrency)
-        successful_extractions = 0
-        failed_chunks = 0
+        stats = self.db.graph_checkpoint_stats(kb_id)
+        successful_extractions = stats["succeeded"]
+        failed_chunks = stats["failed"]
         last_error: BaseException | None = None
         batch_size = max(1, self.settings.graph_concurrency)
         self.db.update_graph_progress(
-            kb_id, stage="extracting", current=0, total=len(chunks), failed_chunks=0
+            kb_id,
+            stage="extracting",
+            current=stats["processed"],
+            total=stats["total"],
+            failed_chunks=failed_chunks,
         )
         for start in range(0, len(chunks), batch_size):
             batch = chunks[start : start + batch_size]
@@ -360,19 +393,27 @@ class GraphRAGService:
             for chunk, result in zip(batch, results, strict=True):
                 if isinstance(result, BaseException):
                     last_error = result
-                    failed_chunks += 1
                     extractions.append(
-                        {"chunk_id": chunk["id"], "entities": [], "relationships": []}
+                        {
+                            "chunk_id": chunk["id"],
+                            "entities": [],
+                            "relationships": [],
+                            "_checkpoint_status": "failed",
+                            "_checkpoint_error": str(result),
+                        }
                     )
                 else:
-                    successful_extractions += 1
+                    result["_checkpoint_status"] = "succeeded"
                     extractions.append(result)
             self._store_extractions(kb_id, extractions)
+            stats = self.db.graph_checkpoint_stats(kb_id)
+            successful_extractions = stats["succeeded"]
+            failed_chunks = stats["failed"]
             self.db.update_graph_progress(
                 kb_id,
                 stage="extracting",
-                current=min(start + len(batch), len(chunks)),
-                total=len(chunks),
+                current=stats["processed"],
+                total=stats["total"],
                 failed_chunks=failed_chunks,
             )
         if successful_extractions == 0:
@@ -381,26 +422,40 @@ class GraphRAGService:
             )
         await self._build_communities(kb_id, failed_chunks)
 
-    async def rebuild(self, kb_id: str) -> None:
-        chunks = self.db.chunks_for_graph(kb_id, self.settings.graph_max_chunks)
-        self.db.start_graph_build(kb_id, len(chunks))
-        try:
+    async def rebuild(self, kb_id: str, *, resume: bool = False) -> None:
+        if resume:
+            stats = self.db.graph_checkpoint_stats(kb_id)
+            if not stats["total"]:
+                self.db.set_graph_status(
+                    kb_id,
+                    "error",
+                    "没有可继续的构建检查点，请从零重新构建",
+                )
+                return
+            chunks = self.db.pending_graph_chunks(kb_id)
+            self.db.resume_graph_build(kb_id)
+        else:
+            chunks = self.db.chunks_for_graph(kb_id, self.settings.graph_max_chunks)
             if not chunks:
-                raise ValueError("知识库中没有可用于建图的文本块")
+                self.db.set_graph_status(kb_id, "error", "知识库中没有可用于建图的文本块")
+                return
+            self.db.clear_graph(kb_id)
+            self.db.prepare_graph_checkpoints(kb_id, [chunk["id"] for chunk in chunks])
+            self.db.start_graph_build(kb_id, len(chunks))
+        try:
             await asyncio.wait_for(
                 self._rebuild_pipeline(kb_id, chunks),
                 timeout=self.settings.graph_build_timeout,
             )
             self.db.set_graph_status(kb_id, "ready")
+            self.db.clear_graph_checkpoints(kb_id)
         except asyncio.CancelledError:
-            self.db.set_graph_status(kb_id, "error", "图谱构建已停止，可重新发起构建")
             raise
         except TimeoutError:
             timeout_minutes = max(1, round(self.settings.graph_build_timeout / 60))
-            self.db.set_graph_status(
+            self.db.pause_graph_build(
                 kb_id,
-                "error",
-                f"图谱构建超过 {timeout_minutes} 分钟上限，已自动停止；可调整超时或限制文本块后重试",
+                f"本轮构建达到 {timeout_minutes} 分钟上限，已自动暂停；已完成结果和检查点均已保留，可调整配置后继续构建",
             )
         except Exception as exc:
             self.db.set_graph_status(kb_id, "error", str(exc)[:1000])

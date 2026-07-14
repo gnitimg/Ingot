@@ -140,11 +140,15 @@ async def lifespan(_: FastAPI):
     try:
         yield
     finally:
-        tasks = list(graph_tasks.values())
-        for task in tasks:
+        active_tasks = list(graph_tasks.items())
+        for _, task in active_tasks:
             task.cancel()
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        if active_tasks:
+            await asyncio.gather(*(task for _, task in active_tasks), return_exceptions=True)
+            for kb_id, _ in active_tasks:
+                knowledge_base = db.get_knowledge_base(kb_id)
+                if knowledge_base and knowledge_base["graph_status"] == "building":
+                    db.pause_graph_build(kb_id, "服务停止导致图谱构建暂停，可从当前检查点继续")
 
 
 app = FastAPI(
@@ -167,9 +171,9 @@ def model_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=502, detail=str(exc))
 
 
-async def run_graph_build(kb_id: str) -> None:
+async def run_graph_build(kb_id: str, *, resume: bool = False) -> None:
     try:
-        await graph_rag.rebuild(kb_id)
+        await graph_rag.rebuild(kb_id, resume=resume)
     finally:
         current_task = asyncio.current_task()
         if graph_tasks.get(kb_id) is current_task:
@@ -180,11 +184,18 @@ def forget_graph_task(kb_id: str, task: asyncio.Task[None]) -> None:
     knowledge_base = db.get_knowledge_base(kb_id)
     if knowledge_base and knowledge_base["graph_status"] == "building":
         if task.cancelled():
-            db.set_graph_status(kb_id, "error", "图谱构建已停止，可重新发起构建")
+            db.pause_graph_build(kb_id, "图谱构建已暂停，可从当前检查点继续")
         elif task.exception() is not None:
             db.set_graph_status(kb_id, "error", f"图谱任务异常退出：{task.exception()}")
     if graph_tasks.get(kb_id) is task:
         graph_tasks.pop(kb_id, None)
+
+
+async def cancel_active_graph_task(kb_id: str) -> None:
+    task = graph_tasks.get(kb_id)
+    if task and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def require_local_request(request: Request) -> None:
@@ -311,10 +322,7 @@ async def get_knowledge_base(kb_id: str) -> dict:
 @app.delete("/api/knowledge-bases/{kb_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_knowledge_base(kb_id: str) -> None:
     require_knowledge_base(kb_id)
-    task = graph_tasks.get(kb_id)
-    if task and not task.done():
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+    await cancel_active_graph_task(kb_id)
     paths = db.delete_knowledge_base(kb_id)
     for path in paths:
         ingestion.remove_file(path)
@@ -329,9 +337,15 @@ async def list_documents(kb_id: str) -> list[dict]:
 
 @app.post("/api/knowledge-bases/{kb_id}/documents")
 async def upload_documents(kb_id: str, files: list[UploadFile] = File(...)) -> dict:
-    require_knowledge_base(kb_id)
+    knowledge_base = require_knowledge_base(kb_id)
     if not files:
         raise HTTPException(status_code=400, detail="请选择至少一个文件")
+    if knowledge_base["graph_status"] in {"building", "paused"}:
+        await cancel_active_graph_task(kb_id)
+        db.invalidate_graph(
+            kb_id,
+            "文档发生变更，原构建检查点和部分图谱已清空；下次构建将从零开始",
+        )
     results = []
     for upload in files:
         try:
@@ -347,6 +361,7 @@ async def upload_documents(kb_id: str, files: list[UploadFile] = File(...)) -> d
 @app.delete("/api/knowledge-bases/{kb_id}/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_document(kb_id: str, document_id: str) -> None:
     require_knowledge_base(kb_id)
+    await cancel_active_graph_task(kb_id)
     path = db.delete_document(kb_id, document_id)
     if path is None:
         raise HTTPException(status_code=404, detail="文档不存在")
@@ -431,14 +446,42 @@ async def rebuild_graph(kb_id: str) -> dict:
 @app.post("/api/knowledge-bases/{kb_id}/graph/cancel", status_code=status.HTTP_202_ACCEPTED)
 async def cancel_graph(kb_id: str) -> dict:
     knowledge_base = require_knowledge_base(kb_id)
-    if knowledge_base["graph_status"] != "building":
-        raise HTTPException(status_code=409, detail="当前没有正在运行的图谱任务")
-    task = graph_tasks.get(kb_id)
-    if task and not task.done():
-        task.cancel()
-    else:
-        db.set_graph_status(kb_id, "error", "构建任务已丢失，请重新构建")
-    return {"status": "cancelling"}
+    if knowledge_base["graph_status"] not in {"building", "paused"}:
+        raise HTTPException(status_code=409, detail="当前没有可停止的图谱任务")
+    await cancel_active_graph_task(kb_id)
+    db.invalidate_graph(
+        kb_id,
+        "图谱构建已由用户停止；部分结果和检查点已清空，下次构建将从零开始",
+        stage="stopped",
+    )
+    return {"status": "stopped"}
+
+
+@app.post("/api/knowledge-bases/{kb_id}/graph/resume", status_code=status.HTTP_202_ACCEPTED)
+async def resume_graph(kb_id: str) -> dict:
+    knowledge_base = require_knowledge_base(kb_id)
+    active_task = graph_tasks.get(kb_id)
+    if active_task and not active_task.done():
+        raise HTTPException(status_code=409, detail="图谱正在构建")
+    if knowledge_base["graph_status"] != "paused":
+        raise HTTPException(status_code=409, detail="当前图谱任务不处于暂停状态")
+    checkpoint = db.graph_checkpoint_stats(kb_id)
+    if not checkpoint["total"]:
+        raise HTTPException(status_code=409, detail="构建检查点不存在，请从零重新构建")
+    db.resume_graph_build(kb_id)
+    task = asyncio.create_task(
+        run_graph_build(kb_id, resume=True),
+        name=f"graph-resume-{kb_id}",
+    )
+    graph_tasks[kb_id] = task
+    task.add_done_callback(lambda completed: forget_graph_task(kb_id, completed))
+    return {
+        "status": "building",
+        "stage": knowledge_base["graph_stage"],
+        "current": checkpoint["processed"],
+        "total": checkpoint["total"],
+        "failed": checkpoint["failed"],
+    }
 
 
 @app.get("/api/knowledge-bases/{kb_id}/graph")

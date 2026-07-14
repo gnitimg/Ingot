@@ -39,16 +39,13 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
         )
         main.db.set_document_status(document_id, "ready", chunk_count=1)
 
-        async def slow_graph_build(target_id):
+        async def slow_graph_build(target_id, *, resume=False):
+            assert resume is False
             main.db.start_graph_build(target_id, 1)
             main.db.update_graph_progress(
                 target_id, stage="extracting", current=0, total=1
             )
-            try:
-                await asyncio.sleep(60)
-            except asyncio.CancelledError:
-                main.db.set_graph_status(target_id, "error", "图谱构建已停止，可重新发起构建")
-                raise
+            await asyncio.sleep(60)
 
         monkeypatch.setattr(main.graph_rag, "rebuild", slow_graph_build)
         started = client.post(f"/api/knowledge-bases/{kb_id}/graph/rebuild")
@@ -58,13 +55,30 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
         assert building["graph_status"] == "building"
         assert building["graph_progress_total"] == 1
         assert client.post(f"/api/knowledge-bases/{kb_id}/graph/cancel").status_code == 202
+        stopped = client.get(f"/api/knowledge-bases/{kb_id}").json()
+        assert stopped["graph_status"] == "stale"
+        assert stopped["graph_stage"] == "stopped"
+        assert stopped["graph_progress_total"] == 0
+
+        main.db.prepare_graph_checkpoints(kb_id, ["graph-chunk"])
+        main.db.start_graph_build(kb_id, 1)
+        main.db.pause_graph_build(kb_id, "测试暂停")
+
+        async def finish_resumed_graph(target_id, *, resume=False):
+            assert target_id == kb_id
+            assert resume is True
+            main.db.set_graph_status(target_id, "ready")
+            main.db.clear_graph_checkpoints(target_id)
+
+        monkeypatch.setattr(main.graph_rag, "rebuild", finish_resumed_graph)
+        resumed = client.post(f"/api/knowledge-bases/{kb_id}/graph/resume")
+        assert resumed.status_code == 202
         for _ in range(50):
-            cancelled = client.get(f"/api/knowledge-bases/{kb_id}").json()
-            if cancelled["graph_status"] == "error":
+            resumed_state = client.get(f"/api/knowledge-bases/{kb_id}").json()
+            if resumed_state["graph_status"] == "ready":
                 break
             time.sleep(0.01)
-        assert cancelled["graph_status"] == "error"
-        assert cancelled["graph_stage"] == "failed"
+        assert resumed_state["graph_status"] == "ready"
 
         assert client.delete(f"/api/knowledge-bases/{kb_id}").status_code == 204
         assert client.get("/api/knowledge-bases").json() == []

@@ -1,4 +1,4 @@
-export type GraphStatus = "empty" | "stale" | "building" | "ready" | "error";
+export type GraphStatus = "empty" | "stale" | "building" | "paused" | "ready" | "error";
 export type RetrievalMode = "vector" | "graph_local" | "graph_global" | "hybrid";
 
 export interface KnowledgeBase {
