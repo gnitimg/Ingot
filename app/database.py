@@ -34,6 +34,12 @@ CREATE TABLE IF NOT EXISTS knowledge_bases (
     description TEXT NOT NULL DEFAULT '',
     graph_status TEXT NOT NULL DEFAULT 'empty',
     graph_error TEXT,
+    graph_stage TEXT NOT NULL DEFAULT '',
+    graph_progress_current INTEGER NOT NULL DEFAULT 0,
+    graph_progress_total INTEGER NOT NULL DEFAULT 0,
+    graph_failed_chunks INTEGER NOT NULL DEFAULT 0,
+    graph_started_at TEXT,
+    graph_heartbeat_at TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -157,6 +163,23 @@ class Database:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         with self.connection() as connection:
             connection.executescript(SCHEMA)
+            knowledge_base_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(knowledge_bases)").fetchall()
+            }
+            knowledge_base_migrations = {
+                "graph_stage": "TEXT NOT NULL DEFAULT ''",
+                "graph_progress_current": "INTEGER NOT NULL DEFAULT 0",
+                "graph_progress_total": "INTEGER NOT NULL DEFAULT 0",
+                "graph_failed_chunks": "INTEGER NOT NULL DEFAULT 0",
+                "graph_started_at": "TEXT",
+                "graph_heartbeat_at": "TEXT",
+            }
+            for column, definition in knowledge_base_migrations.items():
+                if column not in knowledge_base_columns:
+                    connection.execute(
+                        f"ALTER TABLE knowledge_bases ADD COLUMN {column} {definition}"
+                    )
             document_columns = {
                 row["name"] for row in connection.execute("PRAGMA table_info(documents)").fetchall()
             }
@@ -169,10 +192,13 @@ class Database:
             for column, definition in migrations.items():
                 if column not in document_columns:
                     connection.execute(f"ALTER TABLE documents ADD COLUMN {column} {definition}")
+            now = utc_now()
             connection.execute(
                 """UPDATE knowledge_bases
-                   SET graph_status = 'error', graph_error = '服务重启导致构建中断'
-                   WHERE graph_status = 'building'"""
+                   SET graph_status = 'error', graph_error = '服务重启导致构建中断，请重新构建',
+                       graph_stage = 'interrupted', graph_heartbeat_at = ?, updated_at = ?
+                   WHERE graph_status = 'building'""",
+                (now, now),
             )
 
     def fetch_one(self, sql: str, params: Sequence[Any] = ()) -> dict[str, Any] | None:
@@ -230,9 +256,64 @@ class Database:
         self.execute("UPDATE knowledge_bases SET updated_at = ? WHERE id = ?", (utc_now(), kb_id))
 
     def set_graph_status(self, kb_id: str, status: str, error: str | None = None) -> None:
+        now = utc_now()
+        if status in {"empty", "stale"}:
+            self.execute(
+                """UPDATE knowledge_bases
+                   SET graph_status = ?, graph_error = ?, graph_stage = '',
+                       graph_progress_current = 0, graph_progress_total = 0,
+                       graph_failed_chunks = 0, graph_started_at = NULL,
+                       graph_heartbeat_at = NULL, updated_at = ?
+                   WHERE id = ?""",
+                (status, error, now, kb_id),
+            )
+            return
+        stage = "completed" if status == "ready" else "failed" if status == "error" else "queued"
         self.execute(
-            "UPDATE knowledge_bases SET graph_status = ?, graph_error = ?, updated_at = ? WHERE id = ?",
-            (status, error, utc_now(), kb_id),
+            """UPDATE knowledge_bases
+               SET graph_status = ?, graph_error = ?, graph_stage = ?,
+                   graph_heartbeat_at = ?, updated_at = ?
+               WHERE id = ?""",
+            (status, error, stage, now, now, kb_id),
+        )
+
+    def start_graph_build(self, kb_id: str, total: int) -> None:
+        now = utc_now()
+        self.execute(
+            """UPDATE knowledge_bases
+               SET graph_status = 'building', graph_error = NULL, graph_stage = 'queued',
+                   graph_progress_current = 0, graph_progress_total = ?,
+                   graph_failed_chunks = 0, graph_started_at = ?,
+                   graph_heartbeat_at = ?, updated_at = ?
+               WHERE id = ?""",
+            (max(0, total), now, now, now, kb_id),
+        )
+
+    def update_graph_progress(
+        self,
+        kb_id: str,
+        *,
+        stage: str,
+        current: int,
+        total: int,
+        failed_chunks: int = 0,
+    ) -> None:
+        now = utc_now()
+        self.execute(
+            """UPDATE knowledge_bases
+               SET graph_status = 'building', graph_error = NULL, graph_stage = ?,
+                   graph_progress_current = ?, graph_progress_total = ?,
+                   graph_failed_chunks = ?, graph_heartbeat_at = ?, updated_at = ?
+               WHERE id = ?""",
+            (
+                stage,
+                max(0, current),
+                max(0, total),
+                max(0, failed_chunks),
+                now,
+                now,
+                kb_id,
+            ),
         )
 
     def create_document(

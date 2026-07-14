@@ -7,6 +7,12 @@ export interface KnowledgeBase {
   description: string;
   graph_status: GraphStatus;
   graph_error?: string;
+  graph_stage?: string;
+  graph_progress_current?: number;
+  graph_progress_total?: number;
+  graph_failed_chunks?: number;
+  graph_started_at?: string;
+  graph_heartbeat_at?: string;
   document_count: number;
   chunk_count: number;
   entity_count: number;
@@ -35,26 +41,91 @@ export interface PublicSettings {
   embedding_base_url: string;
   embedding_model: string;
   embedding_configured: boolean;
+  embedding_batch_size: number;
+  embedding_timeout: number;
   chat_base_url: string;
   chat_model: string;
   chat_configured: boolean;
+  chat_uses_embedding_provider: boolean;
+  chat_timeout: number;
+  chat_temperature: number;
+  chat_max_tokens: number;
   ocr_enabled: boolean;
   ocr_base_url: string;
   ocr_model: string;
   ocr_configured: boolean;
+  ocr_uses_embedding_provider: boolean;
+  ocr_timeout: number;
   ocr_concurrency: number;
   ocr_min_text_chars: number;
   ocr_max_pages: number;
+  ocr_render_dpi: number;
   rerank_enabled: boolean;
   rerank_base_url: string;
   rerank_model: string;
   rerank_configured: boolean;
+  rerank_uses_embedding_provider: boolean;
   rerank_candidates: number;
+  rerank_timeout: number;
   chunk_size: number;
   chunk_overlap: number;
   default_top_k: number;
   max_upload_mb: number;
+  graph_concurrency: number;
   graph_max_chunks: number;
+  graph_chunk_timeout: number;
+  graph_build_timeout: number;
+}
+
+export interface SettingsUpdate {
+  embedding: {
+    base_url: string;
+    model: string;
+    api_key: string;
+    batch_size: number;
+    timeout: number;
+  };
+  chat: {
+    base_url: string;
+    model: string;
+    api_key: string;
+    use_embedding_provider: boolean;
+    timeout: number;
+    temperature: number;
+    max_tokens: number;
+  };
+  ocr: {
+    enabled: boolean;
+    base_url: string;
+    model: string;
+    api_key: string;
+    use_embedding_provider: boolean;
+    timeout: number;
+    concurrency: number;
+    min_text_chars: number;
+    max_pages: number;
+    render_dpi: number;
+  };
+  rerank: {
+    enabled: boolean;
+    base_url: string;
+    model: string;
+    api_key: string;
+    use_embedding_provider: boolean;
+    candidates: number;
+    timeout: number;
+  };
+  chunking: {
+    chunk_size: number;
+    chunk_overlap: number;
+    default_top_k: number;
+  };
+  graph: {
+    concurrency: number;
+    max_chunks: number;
+    chunk_timeout: number;
+    build_timeout: number;
+  };
 }
 
 export interface SourceChunk {

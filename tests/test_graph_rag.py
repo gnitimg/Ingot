@@ -1,3 +1,7 @@
+import asyncio
+
+from app.config import Settings
+from app.database import Database, new_id
 from app.services.graph_rag import GraphRAGService, normalize_entity_name, parse_json_object
 
 
@@ -18,4 +22,91 @@ def test_detect_communities_separates_components():
     ]
     communities = GraphRAGService._detect_communities(entity_ids, relations)
     assert {frozenset(group) for group in communities} == {frozenset({"a", "b"}), frozenset({"c", "d"})}
+
+
+class FakeGraphAI:
+    async def chat_complete(self, messages, **_kwargs):
+        if len(messages) == 1:
+            return '{"title":"测试主题","summary":"实体甲与实体乙存在明确关系。"}'
+        return """{
+            "entities": [
+                {"name":"实体甲","type":"概念","description":"甲"},
+                {"name":"实体乙","type":"概念","description":"乙"}
+            ],
+            "relationships": [
+                {"source":"实体甲","target":"实体乙","predicate":"关联","description":"测试关系","weight":1}
+            ]
+        }"""
+
+    async def embed_batched(self, texts):
+        return [[1.0, 0.0] for _ in texts]
+
+
+class SlowGraphAI(FakeGraphAI):
+    async def chat_complete(self, messages, **kwargs):
+        await asyncio.sleep(0.05)
+        return await super().chat_complete(messages, **kwargs)
+
+
+def graph_fixture(tmp_path, chunk_count=2):
+    settings = Settings(
+        _env_file=None,
+        data_dir=tmp_path,
+        embedding_api_key="test",
+        chat_api_key="test",
+        graph_concurrency=2,
+        graph_chunk_timeout=15,
+        graph_build_timeout=60,
+    )
+    database = Database(settings.database_path)
+    database.initialize()
+    knowledge_base = database.create_knowledge_base("graph", "")
+    kb_id = knowledge_base["id"]
+    document_id = database.create_document(kb_id, "test.md", "test.md", "md", 10)
+    database.insert_chunks(
+        document_id,
+        kb_id,
+        [
+            {
+                "id": new_id(),
+                "content": f"测试文本 {index}",
+                "chunk_index": index,
+                "embedding": [1.0, 0.0],
+            }
+            for index in range(chunk_count)
+        ],
+    )
+    database.set_document_status(document_id, "ready", chunk_count=chunk_count)
+    return settings, database, kb_id
+
+
+def test_rebuild_records_progress_and_completes(tmp_path):
+    settings, database, kb_id = graph_fixture(tmp_path)
+    service = GraphRAGService(database, FakeGraphAI(), settings)
+
+    asyncio.run(service.rebuild(kb_id))
+
+    knowledge_base = database.get_knowledge_base(kb_id)
+    assert knowledge_base is not None
+    assert knowledge_base["graph_status"] == "ready"
+    assert knowledge_base["graph_stage"] == "completed"
+    assert knowledge_base["graph_failed_chunks"] == 0
+    assert knowledge_base["entity_count"] == 2
+    assert knowledge_base["relationship_count"] == 1
+    assert knowledge_base["community_count"] == 1
+
+
+def test_rebuild_stops_when_every_chunk_times_out(tmp_path):
+    settings, database, kb_id = graph_fixture(tmp_path, chunk_count=1)
+    settings.graph_chunk_timeout = 0.01
+    service = GraphRAGService(database, SlowGraphAI(), settings)
+
+    asyncio.run(service.rebuild(kb_id))
+
+    knowledge_base = database.get_knowledge_base(kb_id)
+    assert knowledge_base is not None
+    assert knowledge_base["graph_status"] == "error"
+    assert knowledge_base["graph_stage"] == "failed"
+    assert knowledge_base["graph_failed_chunks"] == 1
+    assert "所有图谱抽取请求均失败" in knowledge_base["graph_error"]
 

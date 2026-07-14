@@ -247,7 +247,7 @@ class GraphRAGService:
         except Exception:
             return fallback_title[:80], fallback_summary[:2000]
 
-    async def _build_communities(self, kb_id: str) -> None:
+    async def _build_communities(self, kb_id: str, failed_chunks: int) -> None:
         entities = self.db.fetch_all(
             "SELECT id, name, entity_type, description FROM entities WHERE kb_id = ?", (kb_id,)
         )
@@ -257,11 +257,26 @@ class GraphRAGService:
             (kb_id,),
         )
         if not entities:
+            self.db.update_graph_progress(
+                kb_id,
+                stage="communities",
+                current=0,
+                total=0,
+                failed_chunks=failed_chunks,
+            )
             return
         communities = self._detect_communities([entity["id"] for entity in entities], relations)
+        communities = communities[:100]
+        self.db.update_graph_progress(
+            kb_id,
+            stage="communities",
+            current=0,
+            total=len(communities),
+            failed_chunks=failed_chunks,
+        )
         entity_map = {entity["id"]: entity for entity in entities}
         summaries: list[tuple[list[str], str, str]] = []
-        for member_ids in communities[:100]:
+        for index, member_ids in enumerate(communities, start=1):
             members = [entity_map[entity_id] for entity_id in member_ids]
             member_set = set(member_ids)
             internal_relations = [
@@ -271,10 +286,26 @@ class GraphRAGService:
             ]
             title, summary = await self._summarize_community(members, internal_relations)
             summaries.append((member_ids, title, summary))
+            self.db.update_graph_progress(
+                kb_id,
+                stage="communities",
+                current=index,
+                total=len(communities),
+                failed_chunks=failed_chunks,
+            )
 
+        self.db.update_graph_progress(
+            kb_id,
+            stage="embedding",
+            current=0,
+            total=len(summaries),
+            failed_chunks=failed_chunks,
+        )
         embeddings = await self.ai.embed_batched([f"{title}\n{summary}" for _, title, summary in summaries])
         with self.db.connection() as connection:
-            for (member_ids, title, summary), embedding in zip(summaries, embeddings, strict=True):
+            for (member_ids, title, summary), embedding in zip(
+                summaries, embeddings, strict=True
+            ):
                 community_id = new_id()
                 connection.execute(
                     """INSERT INTO communities
@@ -295,36 +326,81 @@ class GraphRAGService:
                     "INSERT INTO community_entities(community_id, entity_id) VALUES (?, ?)",
                     [(community_id, entity_id) for entity_id in member_ids],
                 )
+        self.db.update_graph_progress(
+            kb_id,
+            stage="embedding",
+            current=len(summaries),
+            total=len(summaries),
+            failed_chunks=failed_chunks,
+        )
+
+    async def _rebuild_pipeline(self, kb_id: str, chunks: list[dict[str, Any]]) -> None:
+        self.db.clear_graph(kb_id)
+        semaphore = asyncio.Semaphore(self.settings.graph_concurrency)
+        successful_extractions = 0
+        failed_chunks = 0
+        last_error: BaseException | None = None
+        batch_size = max(1, self.settings.graph_concurrency)
+        self.db.update_graph_progress(
+            kb_id, stage="extracting", current=0, total=len(chunks), failed_chunks=0
+        )
+        for start in range(0, len(chunks), batch_size):
+            batch = chunks[start : start + batch_size]
+            results = await asyncio.gather(
+                *(
+                    asyncio.wait_for(
+                        self._extract_chunk(chunk, semaphore),
+                        timeout=self.settings.graph_chunk_timeout,
+                    )
+                    for chunk in batch
+                ),
+                return_exceptions=True,
+            )
+            extractions: list[dict[str, Any]] = []
+            for chunk, result in zip(batch, results, strict=True):
+                if isinstance(result, BaseException):
+                    last_error = result
+                    failed_chunks += 1
+                    extractions.append(
+                        {"chunk_id": chunk["id"], "entities": [], "relationships": []}
+                    )
+                else:
+                    successful_extractions += 1
+                    extractions.append(result)
+            self._store_extractions(kb_id, extractions)
+            self.db.update_graph_progress(
+                kb_id,
+                stage="extracting",
+                current=min(start + len(batch), len(chunks)),
+                total=len(chunks),
+                failed_chunks=failed_chunks,
+            )
+        if successful_extractions == 0:
+            raise RuntimeError(
+                f"所有图谱抽取请求均失败：{last_error or '模型未返回有效 JSON'}"
+            )
+        await self._build_communities(kb_id, failed_chunks)
 
     async def rebuild(self, kb_id: str) -> None:
-        self.db.set_graph_status(kb_id, "building")
+        chunks = self.db.chunks_for_graph(kb_id, self.settings.graph_max_chunks)
+        self.db.start_graph_build(kb_id, len(chunks))
         try:
-            chunks = self.db.chunks_for_graph(kb_id, self.settings.graph_max_chunks)
             if not chunks:
                 raise ValueError("知识库中没有可用于建图的文本块")
-            self.db.clear_graph(kb_id)
-            semaphore = asyncio.Semaphore(self.settings.graph_concurrency)
-            extractions: list[dict[str, Any]] = []
-            successful_extractions = 0
-            last_error: Exception | None = None
-            for start in range(0, len(chunks), 20):
-                batch = chunks[start : start + 20]
-                results = await asyncio.gather(
-                    *(self._extract_chunk(chunk, semaphore) for chunk in batch),
-                    return_exceptions=True,
-                )
-                for chunk, result in zip(batch, results, strict=True):
-                    if isinstance(result, Exception):
-                        last_error = result
-                        extractions.append({"chunk_id": chunk["id"], "entities": [], "relationships": []})
-                    else:
-                        successful_extractions += 1
-                        extractions.append(result)
-                self._store_extractions(kb_id, extractions)
-                extractions.clear()
-            if successful_extractions == 0:
-                raise RuntimeError(f"所有图谱抽取请求均失败：{last_error or '模型未返回有效 JSON'}")
-            await self._build_communities(kb_id)
+            await asyncio.wait_for(
+                self._rebuild_pipeline(kb_id, chunks),
+                timeout=self.settings.graph_build_timeout,
+            )
             self.db.set_graph_status(kb_id, "ready")
+        except asyncio.CancelledError:
+            self.db.set_graph_status(kb_id, "error", "图谱构建已停止，可重新发起构建")
+            raise
+        except TimeoutError:
+            timeout_minutes = max(1, round(self.settings.graph_build_timeout / 60))
+            self.db.set_graph_status(
+                kb_id,
+                "error",
+                f"图谱构建超过 {timeout_minutes} 分钟上限，已自动停止；可调整超时或限制文本块后重试",
+            )
         except Exception as exc:
             self.db.set_graph_status(kb_id, "error", str(exc)[:1000])

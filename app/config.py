@@ -60,10 +60,12 @@ class Settings(BaseSettings):
 
     graph_concurrency: int = Field(default=3, ge=1, le=10)
     graph_max_chunks: int = Field(default=0, ge=0)
+    graph_chunk_timeout: float = Field(default=240.0, ge=15.0, le=1800.0)
+    graph_build_timeout: float = Field(default=3600.0, ge=60.0, le=86400.0)
 
     @property
     def database_path(self) -> Path:
-        return self.data_dir / "knowledge_forge.db"
+        return self.data_dir / "ingot.db"
 
     @property
     def upload_dir(self) -> Path:
@@ -119,6 +121,9 @@ class Settings(BaseSettings):
 
     def ensure_directories(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        legacy_database = self.data_dir / "knowledge_forge.db"
+        if legacy_database.exists() and not self.database_path.exists():
+            legacy_database.replace(self.database_path)
         self.upload_dir.mkdir(parents=True, exist_ok=True)
 
 

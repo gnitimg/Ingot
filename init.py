@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import getpass
+import json
+import os
 from pathlib import Path
 
 
@@ -19,8 +21,63 @@ def read_env(path: Path = ENV_PATH) -> dict[str, str]:
         if not line or line.startswith("#") or "=" not in line:
             continue
         key, value = line.split("=", 1)
-        values[key.strip()] = value.strip().strip('"').strip("'")
+        value = value.strip()
+        if value.startswith('"') and value.endswith('"'):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = value[1:-1]
+        elif value.startswith("'") and value.endswith("'"):
+            value = value[1:-1]
+        values[key.strip()] = value
     return values
+
+
+def _encode_env_value(value: str) -> str:
+    if "\n" in value or "\r" in value:
+        raise ValueError("配置值不能包含换行符")
+    if "${" in value:
+        raise ValueError("配置值不能包含 ${...}，以免被 .env 变量插值改写")
+    if not value or all(character not in value for character in " \t#'\""):
+        return value
+    return json.dumps(value, ensure_ascii=False)
+
+
+def write_env_updates(updates: dict[str, str], path: Path = ENV_PATH) -> Path:
+    """Atomically update selected .env keys while preserving unrelated values and comments."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    lines = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    pending = dict(updates)
+    output: list[str] = []
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("#") or "=" not in stripped:
+            output.append(raw_line)
+            continue
+        key = stripped.split("=", 1)[0].strip()
+        if key not in updates:
+            output.append(raw_line)
+            continue
+        if key in pending:
+            output.append(f"{key}={_encode_env_value(pending.pop(key))}")
+
+    if pending:
+        if output and output[-1]:
+            output.append("")
+        output.extend(f"{key}={_encode_env_value(value)}" for key, value in pending.items())
+
+    temporary_path = path.with_name(f"{path.name}.tmp")
+    try:
+        temporary_path.write_text("\n".join(output).rstrip() + "\n", encoding="utf-8")
+        os.replace(temporary_path, path)
+        try:
+            path.chmod(0o600)
+        except OSError:
+            pass
+    finally:
+        temporary_path.unlink(missing_ok=True)
+    return path
 
 
 def ask(label: str, default: str = "") -> str:
@@ -123,17 +180,23 @@ def configure(path: Path = ENV_PATH) -> Path:
 EMBEDDING_BASE_URL={embedding_base_url}
 EMBEDDING_API_KEY={embedding_api_key}
 EMBEDDING_MODEL={embedding_model}
+EMBEDDING_BATCH_SIZE={current.get('EMBEDDING_BATCH_SIZE', '16')}
+EMBEDDING_TIMEOUT={current.get('EMBEDDING_TIMEOUT', '90')}
 
 # 留空时复用 Embedding 服务地址和 Key。
 CHAT_BASE_URL={chat_base_url}
 CHAT_API_KEY={chat_api_key}
 CHAT_MODEL={chat_model}
+CHAT_TIMEOUT={current.get('CHAT_TIMEOUT', '180')}
+CHAT_TEMPERATURE={current.get('CHAT_TEMPERATURE', '0.2')}
+CHAT_MAX_TOKENS={current.get('CHAT_MAX_TOKENS', '2048')}
 
 # OCR 与 Reranker 留空地址/Key 时复用 Embedding 服务。
 OCR_ENABLED={str(ocr_enabled).lower()}
 OCR_BASE_URL={current.get('OCR_BASE_URL', '')}
 OCR_API_KEY={current.get('OCR_API_KEY', '')}
 OCR_MODEL={ocr_model}
+OCR_TIMEOUT={current.get('OCR_TIMEOUT', '240')}
 OCR_CONCURRENCY={current.get('OCR_CONCURRENCY', '2')}
 OCR_MIN_TEXT_CHARS={current.get('OCR_MIN_TEXT_CHARS', '80')}
 OCR_MAX_PAGES={ocr_max_pages}
@@ -144,13 +207,15 @@ RERANK_BASE_URL={current.get('RERANK_BASE_URL', '')}
 RERANK_API_KEY={current.get('RERANK_API_KEY', '')}
 RERANK_MODEL={rerank_model}
 RERANK_CANDIDATES={current.get('RERANK_CANDIDATES', '18')}
+RERANK_TIMEOUT={current.get('RERANK_TIMEOUT', '60')}
 
 CHUNK_SIZE={chunk_size}
 CHUNK_OVERLAP={chunk_overlap}
-EMBEDDING_BATCH_SIZE={current.get('EMBEDDING_BATCH_SIZE', '16')}
 DEFAULT_TOP_K={current.get('DEFAULT_TOP_K', '6')}
 GRAPH_CONCURRENCY={current.get('GRAPH_CONCURRENCY', '3')}
 GRAPH_MAX_CHUNKS={current.get('GRAPH_MAX_CHUNKS', '0')}
+GRAPH_CHUNK_TIMEOUT={current.get('GRAPH_CHUNK_TIMEOUT', '240')}
+GRAPH_BUILD_TIMEOUT={current.get('GRAPH_BUILD_TIMEOUT', '3600')}
 APP_HOST={current.get('APP_HOST', '127.0.0.1')}
 APP_PORT={current.get('APP_PORT', '8000')}
 DATA_DIR={current.get('DATA_DIR', './data')}

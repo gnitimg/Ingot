@@ -1,20 +1,24 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
+from ipaddress import ip_address
 from pathlib import Path
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, UploadFile, status
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
 from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
+from pydantic import SecretStr
 
-from app.config import get_settings
+from app.config import Settings, get_settings
 from app.database import Database
-from app.schemas import ChatRequest, KnowledgeBaseCreate, SearchRequest
+from app.schemas import ChatRequest, KnowledgeBaseCreate, SearchRequest, SettingsUpdate
 from app.services.ai_client import AIClient, AIServiceError
 from app.services.graph_rag import GraphRAGService
 from app.services.ingestion import IngestionService
 from app.services.retrieval import RetrievalService
+from init import ENV_PATH, write_env_updates
 
 
 settings = get_settings()
@@ -24,18 +28,128 @@ ingestion = IngestionService(db, ai, settings)
 graph_rag = GraphRAGService(db, ai, settings)
 retrieval = RetrievalService(db, ai, settings)
 static_dir = Path(__file__).parent / "static"
+settings_update_lock = asyncio.Lock()
+graph_tasks: dict[str, asyncio.Task[None]] = {}
+
+RUNTIME_ENV_KEYS = {
+    "embedding_base_url": "EMBEDDING_BASE_URL",
+    "embedding_api_key": "EMBEDDING_API_KEY",
+    "embedding_model": "EMBEDDING_MODEL",
+    "embedding_batch_size": "EMBEDDING_BATCH_SIZE",
+    "embedding_timeout": "EMBEDDING_TIMEOUT",
+    "chat_base_url": "CHAT_BASE_URL",
+    "chat_api_key": "CHAT_API_KEY",
+    "chat_model": "CHAT_MODEL",
+    "chat_timeout": "CHAT_TIMEOUT",
+    "chat_temperature": "CHAT_TEMPERATURE",
+    "chat_max_tokens": "CHAT_MAX_TOKENS",
+    "ocr_enabled": "OCR_ENABLED",
+    "ocr_base_url": "OCR_BASE_URL",
+    "ocr_api_key": "OCR_API_KEY",
+    "ocr_model": "OCR_MODEL",
+    "ocr_timeout": "OCR_TIMEOUT",
+    "ocr_concurrency": "OCR_CONCURRENCY",
+    "ocr_min_text_chars": "OCR_MIN_TEXT_CHARS",
+    "ocr_max_pages": "OCR_MAX_PAGES",
+    "ocr_render_dpi": "OCR_RENDER_DPI",
+    "rerank_enabled": "RERANK_ENABLED",
+    "rerank_base_url": "RERANK_BASE_URL",
+    "rerank_api_key": "RERANK_API_KEY",
+    "rerank_model": "RERANK_MODEL",
+    "rerank_candidates": "RERANK_CANDIDATES",
+    "rerank_timeout": "RERANK_TIMEOUT",
+    "chunk_size": "CHUNK_SIZE",
+    "chunk_overlap": "CHUNK_OVERLAP",
+    "default_top_k": "DEFAULT_TOP_K",
+    "graph_concurrency": "GRAPH_CONCURRENCY",
+    "graph_max_chunks": "GRAPH_MAX_CHUNKS",
+    "graph_chunk_timeout": "GRAPH_CHUNK_TIMEOUT",
+    "graph_build_timeout": "GRAPH_BUILD_TIMEOUT",
+}
+
+
+def _env_value(value: object) -> str:
+    if isinstance(value, bool):
+        return str(value).lower()
+    return str(value)
+
+
+def _retained_secret(replacement: SecretStr | None, current: str) -> str:
+    if replacement is None:
+        return current
+    value = replacement.get_secret_value().strip()
+    return value or current
+
+
+def _candidate_settings(payload: SettingsUpdate) -> Settings:
+    values = settings.model_dump()
+    values.update(
+        embedding_base_url=payload.embedding.base_url,
+        embedding_api_key=_retained_secret(payload.embedding.api_key, settings.embedding_api_key),
+        embedding_model=payload.embedding.model,
+        embedding_batch_size=payload.embedding.batch_size,
+        embedding_timeout=payload.embedding.timeout,
+        chat_base_url="" if payload.chat.use_embedding_provider else payload.chat.base_url,
+        chat_api_key=(
+            ""
+            if payload.chat.use_embedding_provider
+            else _retained_secret(payload.chat.api_key, settings.chat_api_key)
+        ),
+        chat_model=payload.chat.model,
+        chat_timeout=payload.chat.timeout,
+        chat_temperature=payload.chat.temperature,
+        chat_max_tokens=payload.chat.max_tokens,
+        ocr_enabled=payload.ocr.enabled,
+        ocr_base_url="" if payload.ocr.use_embedding_provider else payload.ocr.base_url,
+        ocr_api_key=(
+            ""
+            if payload.ocr.use_embedding_provider
+            else _retained_secret(payload.ocr.api_key, settings.ocr_api_key)
+        ),
+        ocr_model=payload.ocr.model,
+        ocr_timeout=payload.ocr.timeout,
+        ocr_concurrency=payload.ocr.concurrency,
+        ocr_min_text_chars=payload.ocr.min_text_chars,
+        ocr_max_pages=payload.ocr.max_pages,
+        ocr_render_dpi=payload.ocr.render_dpi,
+        rerank_enabled=payload.rerank.enabled,
+        rerank_base_url="" if payload.rerank.use_embedding_provider else payload.rerank.base_url,
+        rerank_api_key=(
+            ""
+            if payload.rerank.use_embedding_provider
+            else _retained_secret(payload.rerank.api_key, settings.rerank_api_key)
+        ),
+        rerank_model=payload.rerank.model,
+        rerank_candidates=payload.rerank.candidates,
+        rerank_timeout=payload.rerank.timeout,
+        chunk_size=payload.chunking.chunk_size,
+        chunk_overlap=payload.chunking.chunk_overlap,
+        default_top_k=payload.chunking.default_top_k,
+        graph_concurrency=payload.graph.concurrency,
+        graph_max_chunks=payload.graph.max_chunks,
+        graph_chunk_timeout=payload.graph.chunk_timeout,
+        graph_build_timeout=payload.graph.build_timeout,
+    )
+    return Settings(_env_file=None, **values)
 
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     settings.ensure_directories()
     db.initialize()
-    yield
+    try:
+        yield
+    finally:
+        tasks = list(graph_tasks.values())
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 app = FastAPI(
     title="Ingot API",
-    description="Local-first RAG + GraphRAG knowledge-base application",
+    description="Local-first RAG + OCR + GraphRAG knowledge-base application",
     version="1.1.0",
     lifespan=lifespan,
 )
@@ -53,9 +167,44 @@ def model_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=502, detail=str(exc))
 
 
+async def run_graph_build(kb_id: str) -> None:
+    try:
+        await graph_rag.rebuild(kb_id)
+    finally:
+        current_task = asyncio.current_task()
+        if graph_tasks.get(kb_id) is current_task:
+            graph_tasks.pop(kb_id, None)
+
+
+def forget_graph_task(kb_id: str, task: asyncio.Task[None]) -> None:
+    knowledge_base = db.get_knowledge_base(kb_id)
+    if knowledge_base and knowledge_base["graph_status"] == "building":
+        if task.cancelled():
+            db.set_graph_status(kb_id, "error", "图谱构建已停止，可重新发起构建")
+        elif task.exception() is not None:
+            db.set_graph_status(kb_id, "error", f"图谱任务异常退出：{task.exception()}")
+    if graph_tasks.get(kb_id) is task:
+        graph_tasks.pop(kb_id, None)
+
+
+def require_local_request(request: Request) -> None:
+    host = request.client.host if request.client else ""
+    try:
+        is_local = ip_address(host).is_loopback
+    except ValueError:
+        is_local = host == "testclient"
+    if not is_local:
+        raise HTTPException(status_code=403, detail="运行配置只能从本机修改")
+
+
 @app.get("/", include_in_schema=False)
 async def index() -> FileResponse:
     return FileResponse(static_dir / "index.html")
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon() -> FileResponse:
+    return FileResponse(static_dir / "favicon.svg", media_type="image/svg+xml")
 
 
 @app.get("/api/health")
@@ -79,27 +228,69 @@ async def public_settings() -> dict:
         "embedding_base_url": settings.embedding_base_url,
         "embedding_model": settings.embedding_model,
         "embedding_configured": settings.embedding_configured,
+        "embedding_batch_size": settings.embedding_batch_size,
+        "embedding_timeout": settings.embedding_timeout,
         "chat_base_url": settings.effective_chat_base_url,
         "chat_model": settings.chat_model,
         "chat_configured": settings.chat_configured,
+        "chat_uses_embedding_provider": (
+            not settings.chat_base_url.strip() and not settings.chat_api_key.strip()
+        ),
+        "chat_timeout": settings.chat_timeout,
+        "chat_temperature": settings.chat_temperature,
+        "chat_max_tokens": settings.chat_max_tokens,
         "ocr_enabled": settings.ocr_enabled,
         "ocr_base_url": settings.effective_ocr_base_url,
         "ocr_model": settings.ocr_model,
         "ocr_configured": settings.ocr_configured,
+        "ocr_uses_embedding_provider": (
+            not settings.ocr_base_url.strip() and not settings.ocr_api_key.strip()
+        ),
+        "ocr_timeout": settings.ocr_timeout,
         "ocr_concurrency": settings.ocr_concurrency,
         "ocr_min_text_chars": settings.ocr_min_text_chars,
         "ocr_max_pages": settings.ocr_max_pages,
+        "ocr_render_dpi": settings.ocr_render_dpi,
         "rerank_enabled": settings.rerank_enabled,
         "rerank_base_url": settings.effective_rerank_base_url,
         "rerank_model": settings.rerank_model,
         "rerank_configured": settings.rerank_configured,
+        "rerank_uses_embedding_provider": (
+            not settings.rerank_base_url.strip() and not settings.rerank_api_key.strip()
+        ),
         "rerank_candidates": settings.rerank_candidates,
+        "rerank_timeout": settings.rerank_timeout,
         "chunk_size": settings.chunk_size,
         "chunk_overlap": settings.chunk_overlap,
         "default_top_k": settings.default_top_k,
         "max_upload_mb": settings.max_upload_mb,
+        "graph_concurrency": settings.graph_concurrency,
         "graph_max_chunks": settings.graph_max_chunks,
+        "graph_chunk_timeout": settings.graph_chunk_timeout,
+        "graph_build_timeout": settings.graph_build_timeout,
     }
+
+
+@app.put("/api/settings")
+async def update_settings(payload: SettingsUpdate, request: Request) -> dict:
+    require_local_request(request)
+    async with settings_update_lock:
+        candidate = _candidate_settings(payload)
+        env_updates = {
+            env_key: _env_value(getattr(candidate, field_name))
+            for field_name, env_key in RUNTIME_ENV_KEYS.items()
+        }
+        try:
+            await asyncio.to_thread(write_env_updates, env_updates, ENV_PATH)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+        except OSError as exc:
+            raise HTTPException(status_code=500, detail="无法安全写入本地 .env 配置") from exc
+
+        for field_name in RUNTIME_ENV_KEYS:
+            setattr(settings, field_name, getattr(candidate, field_name))
+
+    return await public_settings()
 
 
 @app.get("/api/knowledge-bases")
@@ -120,6 +311,10 @@ async def get_knowledge_base(kb_id: str) -> dict:
 @app.delete("/api/knowledge-bases/{kb_id}", status_code=status.HTTP_204_NO_CONTENT)
 async def delete_knowledge_base(kb_id: str) -> None:
     require_knowledge_base(kb_id)
+    task = graph_tasks.get(kb_id)
+    if task and not task.done():
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
     paths = db.delete_knowledge_base(kb_id)
     for path in paths:
         ingestion.remove_file(path)
@@ -216,15 +411,34 @@ async def chat(kb_id: str, payload: ChatRequest) -> StreamingResponse:
 
 
 @app.post("/api/knowledge-bases/{kb_id}/graph/rebuild", status_code=status.HTTP_202_ACCEPTED)
-async def rebuild_graph(kb_id: str, background_tasks: BackgroundTasks) -> dict:
+async def rebuild_graph(kb_id: str) -> dict:
     knowledge_base = require_knowledge_base(kb_id)
-    if knowledge_base["graph_status"] == "building":
+    active_task = graph_tasks.get(kb_id)
+    if active_task and not active_task.done():
         raise HTTPException(status_code=409, detail="图谱正在构建")
     if not knowledge_base["chunk_count"]:
         raise HTTPException(status_code=400, detail="请先上传并解析文档")
-    db.set_graph_status(kb_id, "building")
-    background_tasks.add_task(graph_rag.rebuild, kb_id)
-    return {"status": "building"}
+    total = int(knowledge_base["chunk_count"])
+    if settings.graph_max_chunks:
+        total = min(total, settings.graph_max_chunks)
+    db.start_graph_build(kb_id, total)
+    task = asyncio.create_task(run_graph_build(kb_id), name=f"graph-build-{kb_id}")
+    graph_tasks[kb_id] = task
+    task.add_done_callback(lambda completed: forget_graph_task(kb_id, completed))
+    return {"status": "building", "stage": "queued", "current": 0, "total": total}
+
+
+@app.post("/api/knowledge-bases/{kb_id}/graph/cancel", status_code=status.HTTP_202_ACCEPTED)
+async def cancel_graph(kb_id: str) -> dict:
+    knowledge_base = require_knowledge_base(kb_id)
+    if knowledge_base["graph_status"] != "building":
+        raise HTTPException(status_code=409, detail="当前没有正在运行的图谱任务")
+    task = graph_tasks.get(kb_id)
+    if task and not task.done():
+        task.cancel()
+    else:
+        db.set_graph_status(kb_id, "error", "构建任务已丢失，请重新构建")
+    return {"status": "cancelling"}
 
 
 @app.get("/api/knowledge-bases/{kb_id}/graph")
