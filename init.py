@@ -190,6 +190,7 @@ CHAT_MODEL={chat_model}
 CHAT_TIMEOUT={current.get('CHAT_TIMEOUT', '180')}
 CHAT_TEMPERATURE={current.get('CHAT_TEMPERATURE', '0.2')}
 CHAT_MAX_TOKENS={current.get('CHAT_MAX_TOKENS', '2048')}
+QA_EVIDENCE_COUNT={current.get('QA_EVIDENCE_COUNT', current.get('DEFAULT_TOP_K', '6'))}
 
 # OCR 与 Reranker 留空地址/Key 时复用 Embedding 服务。
 OCR_ENABLED={str(ocr_enabled).lower()}
@@ -216,6 +217,8 @@ GRAPH_CONCURRENCY={current.get('GRAPH_CONCURRENCY', '3')}
 GRAPH_MAX_CHUNKS={current.get('GRAPH_MAX_CHUNKS', '0')}
 GRAPH_CHUNK_TIMEOUT={current.get('GRAPH_CHUNK_TIMEOUT', '240')}
 GRAPH_BUILD_TIMEOUT={current.get('GRAPH_BUILD_TIMEOUT', '3600')}
+GRAPH_RETRY_ROUNDS={current.get('GRAPH_RETRY_ROUNDS', '2')}
+GRAPH_RETRY_BACKOFF={current.get('GRAPH_RETRY_BACKOFF', '2')}
 APP_HOST={current.get('APP_HOST', '127.0.0.1')}
 APP_PORT={current.get('APP_PORT', '8000')}
 DATA_DIR={current.get('DATA_DIR', './data')}

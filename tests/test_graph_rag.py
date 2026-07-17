@@ -2,6 +2,7 @@ import asyncio
 
 from app.config import Settings
 from app.database import Database, new_id
+from app.services.ai_client import AIServiceError
 from app.services.graph_rag import GraphRAGService, normalize_entity_name, parse_json_object
 
 
@@ -60,6 +61,19 @@ class PauseAfterFirstChunkAI(FakeGraphAI):
         return await super().chat_complete(messages, **kwargs)
 
 
+class FlakyGraphAI(FakeGraphAI):
+    def __init__(self, failures: int):
+        self.failures = failures
+        self.extraction_calls = 0
+
+    async def chat_complete(self, messages, **kwargs):
+        if len(messages) > 1:
+            self.extraction_calls += 1
+            if self.extraction_calls <= self.failures:
+                raise AIServiceError("rate limited", status_code=429, retryable=True)
+        return await super().chat_complete(messages, **kwargs)
+
+
 def graph_fixture(tmp_path, chunk_count=2):
     settings = Settings(
         _env_file=None,
@@ -108,19 +122,45 @@ def test_rebuild_records_progress_and_completes(tmp_path):
     assert knowledge_base["community_count"] == 1
 
 
-def test_rebuild_stops_when_every_chunk_times_out(tmp_path):
+def test_rebuild_pauses_when_chunk_retries_are_exhausted(tmp_path):
     settings, database, kb_id = graph_fixture(tmp_path, chunk_count=1)
     settings.graph_chunk_timeout = 0.01
+    settings.graph_retry_rounds = 1
+    settings.graph_retry_backoff = 0
     service = GraphRAGService(database, SlowGraphAI(), settings)
 
     asyncio.run(service.rebuild(kb_id))
 
     knowledge_base = database.get_knowledge_base(kb_id)
     assert knowledge_base is not None
-    assert knowledge_base["graph_status"] == "error"
-    assert knowledge_base["graph_stage"] == "failed"
+    assert knowledge_base["graph_status"] == "paused"
+    assert knowledge_base["graph_stage"] == "retrying"
     assert knowledge_base["graph_failed_chunks"] == 1
-    assert "所有图谱抽取请求均失败" in knowledge_base["graph_error"]
+    assert "自动降并发重试" in knowledge_base["graph_error"]
+    assert database.graph_checkpoint_stats(kb_id)["failed"] == 1
+
+    service.ai = FakeGraphAI()
+    settings.graph_chunk_timeout = 15
+    asyncio.run(service.rebuild(kb_id, resume=True))
+    completed = database.get_knowledge_base(kb_id)
+    assert completed is not None
+    assert completed["graph_status"] == "ready"
+
+
+def test_transient_failure_is_retried_before_graph_is_ready(tmp_path):
+    settings, database, kb_id = graph_fixture(tmp_path, chunk_count=2)
+    settings.graph_retry_rounds = 2
+    settings.graph_retry_backoff = 0
+    ai = FlakyGraphAI(failures=2)
+    service = GraphRAGService(database, ai, settings)
+
+    asyncio.run(service.rebuild(kb_id))
+
+    completed = database.get_knowledge_base(kb_id)
+    assert completed is not None
+    assert completed["graph_status"] == "ready"
+    assert completed["graph_failed_chunks"] == 0
+    assert ai.extraction_calls == 4
 
 
 def test_total_timeout_pauses_and_resume_uses_checkpoint(tmp_path):

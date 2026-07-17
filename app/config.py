@@ -57,11 +57,14 @@ class Settings(BaseSettings):
     chunk_size: int = Field(default=900, ge=200, le=8000)
     chunk_overlap: int = Field(default=160, ge=0, le=2000)
     default_top_k: int = Field(default=6, ge=1, le=30)
+    qa_evidence_count: int = Field(default=6, ge=1, le=30)
 
-    graph_concurrency: int = Field(default=3, ge=1, le=10)
+    graph_concurrency: int = Field(default=3, ge=1, le=1000)
     graph_max_chunks: int = Field(default=0, ge=0)
     graph_chunk_timeout: float = Field(default=240.0, ge=15.0, le=1800.0)
     graph_build_timeout: float = Field(default=3600.0, ge=60.0, le=86400.0)
+    graph_retry_rounds: int = Field(default=2, ge=0, le=5)
+    graph_retry_backoff: float = Field(default=2.0, ge=0.1, le=60.0)
 
     @property
     def database_path(self) -> Path:

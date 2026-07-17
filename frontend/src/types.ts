@@ -18,6 +18,8 @@ export interface KnowledgeBase {
   entity_count: number;
   relationship_count: number;
   community_count?: number;
+  has_password: boolean | number;
+  access_token?: string;
   created_at: string;
   updated_at: string;
 }
@@ -27,6 +29,7 @@ export interface DocumentItem {
   filename: string;
   file_type: string;
   size_bytes: number;
+  sha256: string;
   chunk_count: number;
   status: "processing" | "ready" | "error";
   extraction_method: "pending" | "native" | "ocr" | "hybrid";
@@ -50,6 +53,7 @@ export interface PublicSettings {
   chat_timeout: number;
   chat_temperature: number;
   chat_max_tokens: number;
+  qa_evidence_count: number;
   ocr_enabled: boolean;
   ocr_base_url: string;
   ocr_model: string;
@@ -75,6 +79,8 @@ export interface PublicSettings {
   graph_max_chunks: number;
   graph_chunk_timeout: number;
   graph_build_timeout: number;
+  graph_retry_rounds: number;
+  graph_retry_backoff: number;
 }
 
 export interface SettingsUpdate {
@@ -93,6 +99,7 @@ export interface SettingsUpdate {
     timeout: number;
     temperature: number;
     max_tokens: number;
+    evidence_count: number;
   };
   ocr: {
     enabled: boolean;
@@ -125,6 +132,8 @@ export interface SettingsUpdate {
     max_chunks: number;
     chunk_timeout: number;
     build_timeout: number;
+    retry_rounds: number;
+    retry_backoff: number;
   };
 }
 

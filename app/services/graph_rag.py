@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import random
 import re
 from collections import defaultdict
 from typing import Any
@@ -47,7 +48,17 @@ class GraphRAGService:
         self.settings = settings
 
     async def _extract_chunk(self, chunk: dict[str, Any], semaphore: asyncio.Semaphore) -> dict[str, Any]:
-        prompt = f"文件：{chunk['filename']}\n文本块：{chunk['chunk_index'] + 1}\n\n{chunk['content'][:6000]}"
+        extraction_limits = (
+            "\n\n抽取约束：最多返回 12 个实体、18 条关系；"
+            "优先保留对问答有价值的核心概念、表名、字段名、角色、流程、指标和系统模块；"
+            "实体与关系描述均控制在 80 字以内；不要输出 Markdown、解释文本或额外字段。"
+        )
+        prompt = (
+            f"文件：{chunk['filename']}\n"
+            f"文本块：{chunk['chunk_index'] + 1}\n\n"
+            f"{chunk['content'][:6000]}"
+            f"{extraction_limits}"
+        )
         async with semaphore:
             try:
                 response = await self.ai.chat_complete(
@@ -59,7 +70,12 @@ class GraphRAGService:
                     max_tokens=1600,
                     json_mode=True,
                 )
-            except AIServiceError:
+            except AIServiceError as exc:
+                # Plain JSON fallback is only for providers that explicitly do
+                # not support response_format. Falling back after 429/timeouts
+                # would immediately double the request storm.
+                if not exc.json_mode_unsupported:
+                    raise
                 response = await self.ai.chat_complete(
                     [
                         {"role": "system", "content": GRAPH_SYSTEM_PROMPT},
@@ -179,7 +195,7 @@ class GraphRAGService:
                     )
                 connection.execute(
                     """UPDATE graph_build_chunks
-                       SET status = ?, error = ?, updated_at = ?
+                       SET status = ?, error = ?, attempts = attempts + 1, updated_at = ?
                        WHERE kb_id = ? AND chunk_id = ?""",
                     (
                         str(extraction.get("_checkpoint_status", "succeeded")),
@@ -363,64 +379,135 @@ class GraphRAGService:
             failed_chunks=failed_chunks,
         )
 
-    async def _rebuild_pipeline(self, kb_id: str, chunks: list[dict[str, Any]]) -> None:
-        semaphore = asyncio.Semaphore(self.settings.graph_concurrency)
+    @staticmethod
+    def _is_retryable_extraction_error(error: BaseException) -> bool:
+        if isinstance(error, AIServiceError):
+            return error.retryable
+        return isinstance(error, (TimeoutError, ValueError, ConnectionError))
+
+    async def _rebuild_pipeline(self, kb_id: str, chunks: list[dict[str, Any]]) -> bool:
         stats = self.db.graph_checkpoint_stats(kb_id)
-        successful_extractions = stats["succeeded"]
-        failed_chunks = stats["failed"]
         last_error: BaseException | None = None
-        batch_size = max(1, self.settings.graph_concurrency)
+        fatal_error: BaseException | None = None
+        configured_concurrency = max(1, self.settings.graph_concurrency)
+        remaining = chunks
         self.db.update_graph_progress(
             kb_id,
             stage="extracting",
-            current=stats["processed"],
+            current=stats["succeeded"],
             total=stats["total"],
-            failed_chunks=failed_chunks,
+            failed_chunks=max(0, stats["total"] - stats["succeeded"] - len(remaining)),
         )
-        for start in range(0, len(chunks), batch_size):
-            batch = chunks[start : start + batch_size]
-            results = await asyncio.gather(
-                *(
-                    asyncio.wait_for(
-                        self._extract_chunk(chunk, semaphore),
-                        timeout=self.settings.graph_chunk_timeout,
-                    )
-                    for chunk in batch
-                ),
-                return_exceptions=True,
-            )
-            extractions: list[dict[str, Any]] = []
-            for chunk, result in zip(batch, results, strict=True):
-                if isinstance(result, BaseException):
-                    last_error = result
-                    extractions.append(
-                        {
-                            "chunk_id": chunk["id"],
-                            "entities": [],
-                            "relationships": [],
-                            "_checkpoint_status": "failed",
-                            "_checkpoint_error": str(result),
-                        }
-                    )
-                else:
-                    result["_checkpoint_status"] = "succeeded"
-                    extractions.append(result)
-            self._store_extractions(kb_id, extractions)
-            stats = self.db.graph_checkpoint_stats(kb_id)
-            successful_extractions = stats["succeeded"]
-            failed_chunks = stats["failed"]
+        for round_index in range(self.settings.graph_retry_rounds + 1):
+            if not remaining:
+                break
+            divisor = 2**round_index
+            concurrency = max(1, (configured_concurrency + divisor - 1) // divisor)
+            semaphore = asyncio.Semaphore(concurrency)
+            retry_queue: list[dict[str, Any]] = []
+            stage = "extracting" if round_index == 0 else "retrying"
+            start = 0
+            while start < len(remaining):
+                batch = remaining[start : start + concurrency]
+                results = await asyncio.gather(
+                    *(
+                        asyncio.wait_for(
+                            self._extract_chunk(chunk, semaphore),
+                            timeout=self.settings.graph_chunk_timeout,
+                        )
+                        for chunk in batch
+                    ),
+                    return_exceptions=True,
+                )
+                extractions: list[dict[str, Any]] = []
+                batch_retryable_failures = 0
+                for chunk, result in zip(batch, results, strict=True):
+                    if isinstance(result, BaseException):
+                        last_error = result
+                        retryable = self._is_retryable_extraction_error(result)
+                        if retryable:
+                            batch_retryable_failures += 1
+                        should_retry = retryable and round_index < self.settings.graph_retry_rounds
+                        if should_retry:
+                            retry_queue.append(chunk)
+                        elif not retryable:
+                            fatal_error = result
+                        extractions.append(
+                            {
+                                "chunk_id": chunk["id"],
+                                "entities": [],
+                                "relationships": [],
+                                "_checkpoint_status": "pending" if should_retry else "failed",
+                                "_checkpoint_error": str(result),
+                            }
+                        )
+                    else:
+                        result["_checkpoint_status"] = "succeeded"
+                        result["_checkpoint_error"] = None
+                        extractions.append(result)
+                self._store_extractions(kb_id, extractions)
+                stats = self.db.graph_checkpoint_stats(kb_id)
+                unresolved = stats["failed"] + len(retry_queue)
+                if round_index > 0:
+                    unresolved += max(0, len(remaining) - start - len(batch))
+                self.db.update_graph_progress(
+                    kb_id,
+                    stage=stage,
+                    current=stats["succeeded"],
+                    total=stats["total"],
+                    failed_chunks=unresolved,
+                )
+                if fatal_error is not None:
+                    break
+                start += len(batch)
+                if (
+                    concurrency > 1
+                    and batch_retryable_failures / max(1, len(batch)) >= 0.25
+                ):
+                    # Reduce pressure immediately for the rest of this pass instead
+                    # of waiting until every chunk has already hit the provider.
+                    concurrency = max(1, (concurrency + 1) // 2)
+                    semaphore = asyncio.Semaphore(concurrency)
+            if fatal_error is not None:
+                break
+            remaining = retry_queue
+            if remaining and round_index < self.settings.graph_retry_rounds:
+                self.db.update_graph_progress(
+                    kb_id,
+                    stage="retrying",
+                    current=stats["succeeded"],
+                    total=stats["total"],
+                    failed_chunks=len(remaining) + stats["failed"],
+                )
+                delay = min(
+                    60.0,
+                    self.settings.graph_retry_backoff * (2**round_index)
+                    + random.uniform(0, self.settings.graph_retry_backoff),
+                )
+                await asyncio.sleep(delay)
+
+        stats = self.db.graph_checkpoint_stats(kb_id)
+        unresolved = max(0, stats["total"] - stats["succeeded"])
+        if unresolved:
             self.db.update_graph_progress(
                 kb_id,
-                stage="extracting",
-                current=stats["processed"],
+                stage="retrying" if fatal_error is None else "extracting",
+                current=stats["succeeded"],
                 total=stats["total"],
-                failed_chunks=failed_chunks,
+                failed_chunks=unresolved,
             )
-        if successful_extractions == 0:
-            raise RuntimeError(
-                f"所有图谱抽取请求均失败：{last_error or '模型未返回有效 JSON'}"
+            detail = str(last_error or "模型未返回有效 JSON")[:260]
+            reason = (
+                f"模型请求出现不可重试错误，尚有 {unresolved} 个文本块未完成：{detail}；"
+                "请检查模型配置后继续构建"
+                if fatal_error is not None
+                else f"{unresolved} 个文本块在自动降并发重试后仍未成功：{detail}；"
+                "任务已暂停，继续构建只会重试未完成块"
             )
-        await self._build_communities(kb_id, failed_chunks)
+            self.db.pause_graph_build(kb_id, reason)
+            return False
+        await self._build_communities(kb_id, 0)
+        return True
 
     async def rebuild(self, kb_id: str, *, resume: bool = False) -> None:
         if resume:
@@ -432,8 +519,8 @@ class GraphRAGService:
                     "没有可继续的构建检查点，请从零重新构建",
                 )
                 return
-            chunks = self.db.pending_graph_chunks(kb_id)
             self.db.resume_graph_build(kb_id)
+            chunks = self.db.pending_graph_chunks(kb_id)
         else:
             chunks = self.db.chunks_for_graph(kb_id, self.settings.graph_max_chunks)
             if not chunks:
@@ -443,10 +530,12 @@ class GraphRAGService:
             self.db.prepare_graph_checkpoints(kb_id, [chunk["id"] for chunk in chunks])
             self.db.start_graph_build(kb_id, len(chunks))
         try:
-            await asyncio.wait_for(
+            completed = await asyncio.wait_for(
                 self._rebuild_pipeline(kb_id, chunks),
                 timeout=self.settings.graph_build_timeout,
             )
+            if not completed:
+                return
             self.db.set_graph_status(kb_id, "ready")
             self.db.clear_graph_checkpoints(kb_id)
         except asyncio.CancelledError:
@@ -457,5 +546,13 @@ class GraphRAGService:
                 kb_id,
                 f"本轮构建达到 {timeout_minutes} 分钟上限，已自动暂停；已完成结果和检查点均已保留，可调整配置后继续构建",
             )
+        except AIServiceError as exc:
+            if exc.retryable:
+                self.db.pause_graph_build(
+                    kb_id,
+                    f"模型服务暂时不可用，构建已暂停且检查点已保留：{str(exc)[:500]}",
+                )
+            else:
+                self.db.set_graph_status(kb_id, "error", str(exc)[:1000])
         except Exception as exc:
             self.db.set_graph_status(kb_id, "error", str(exc)[:1000])

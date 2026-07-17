@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import hmac
 import sqlite3
+import secrets
 import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
@@ -9,6 +12,49 @@ from pathlib import Path
 from typing import Any, Iterator, Sequence
 
 import numpy as np
+
+
+PASSWORD_ITERATIONS = 390_000
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        bytes.fromhex(salt),
+        PASSWORD_ITERATIONS,
+    ).hex()
+    return f"pbkdf2_sha256${PASSWORD_ITERATIONS}${salt}${digest}"
+
+
+def verify_password(password: str, encoded: str) -> bool:
+    if not encoded:
+        return not password
+    try:
+        algorithm, iterations, salt, expected = encoded.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        digest = hashlib.pbkdf2_hmac(
+            "sha256",
+            password.encode("utf-8"),
+            bytes.fromhex(salt),
+            int(iterations),
+        ).hex()
+    except (ValueError, TypeError):
+        return False
+    return hmac.compare_digest(digest, expected)
+
+
+def file_sha256(path: Path) -> str:
+    hasher = hashlib.sha256()
+    try:
+        with path.open("rb") as handle:
+            for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                hasher.update(chunk)
+    except OSError:
+        return ""
+    return hasher.hexdigest()
 
 
 def utc_now() -> str:
@@ -32,6 +78,7 @@ CREATE TABLE IF NOT EXISTS knowledge_bases (
     id TEXT PRIMARY KEY,
     name TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
+    password_hash TEXT NOT NULL DEFAULT '',
     graph_status TEXT NOT NULL DEFAULT 'empty',
     graph_error TEXT,
     graph_stage TEXT NOT NULL DEFAULT '',
@@ -51,6 +98,7 @@ CREATE TABLE IF NOT EXISTS documents (
     stored_path TEXT NOT NULL,
     file_type TEXT NOT NULL,
     size_bytes INTEGER NOT NULL DEFAULT 0,
+    sha256 TEXT NOT NULL DEFAULT '',
     chunk_count INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'processing',
     extraction_method TEXT NOT NULL DEFAULT 'pending',
@@ -86,6 +134,7 @@ CREATE TABLE IF NOT EXISTS graph_build_chunks (
     position INTEGER NOT NULL,
     status TEXT NOT NULL DEFAULT 'pending',
     error TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
     updated_at TEXT NOT NULL,
     PRIMARY KEY(kb_id, chunk_id)
 );
@@ -153,6 +202,15 @@ CREATE TABLE IF NOT EXISTS community_entities (
 """
 
 
+KB_PUBLIC_COLUMNS = """
+    kb.id, kb.name, kb.description, kb.graph_status, kb.graph_error,
+    kb.graph_stage, kb.graph_progress_current, kb.graph_progress_total,
+    kb.graph_failed_chunks, kb.graph_started_at, kb.graph_heartbeat_at,
+    kb.created_at, kb.updated_at,
+    CASE WHEN COALESCE(kb.password_hash, '') != '' THEN 1 ELSE 0 END AS has_password
+"""
+
+
 class Database:
     def __init__(self, path: Path):
         self.path = path
@@ -174,6 +232,7 @@ class Database:
 
     def initialize(self) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        legacy_timeout_ids: list[str] = []
         with self.connection() as connection:
             connection.executescript(SCHEMA)
             knowledge_base_columns = {
@@ -181,6 +240,7 @@ class Database:
                 for row in connection.execute("PRAGMA table_info(knowledge_bases)").fetchall()
             }
             knowledge_base_migrations = {
+                "password_hash": "TEXT NOT NULL DEFAULT ''",
                 "graph_stage": "TEXT NOT NULL DEFAULT ''",
                 "graph_progress_current": "INTEGER NOT NULL DEFAULT 0",
                 "graph_progress_total": "INTEGER NOT NULL DEFAULT 0",
@@ -197,6 +257,7 @@ class Database:
                 row["name"] for row in connection.execute("PRAGMA table_info(documents)").fetchall()
             }
             migrations = {
+                "sha256": "TEXT NOT NULL DEFAULT ''",
                 "extraction_method": "TEXT NOT NULL DEFAULT 'pending'",
                 "page_count": "INTEGER NOT NULL DEFAULT 0",
                 "ocr_page_count": "INTEGER NOT NULL DEFAULT 0",
@@ -205,6 +266,24 @@ class Database:
             for column, definition in migrations.items():
                 if column not in document_columns:
                     connection.execute(f"ALTER TABLE documents ADD COLUMN {column} {definition}")
+            documents_missing_hash = connection.execute(
+                "SELECT id, stored_path FROM documents WHERE COALESCE(sha256, '') = ''"
+            ).fetchall()
+            for document in documents_missing_hash:
+                digest = file_sha256(Path(str(document["stored_path"])))
+                if digest:
+                    connection.execute(
+                        "UPDATE documents SET sha256 = ? WHERE id = ?",
+                        (digest, document["id"]),
+                    )
+            checkpoint_columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(graph_build_chunks)").fetchall()
+            }
+            if "attempts" not in checkpoint_columns:
+                connection.execute(
+                    "ALTER TABLE graph_build_chunks ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0"
+                )
             now = utc_now()
             connection.execute(
                 """UPDATE knowledge_bases
@@ -215,6 +294,18 @@ class Database:
                    WHERE graph_status = 'building'""",
                 (now, now),
             )
+            legacy_timeout_ids = [
+                str(row["id"])
+                for row in connection.execute(
+                    """SELECT id FROM knowledge_bases
+                       WHERE graph_status = 'paused'
+                          OR (graph_status = 'ready' AND graph_failed_chunks > 0)
+                          OR (graph_status = 'error'
+                              AND graph_error LIKE '图谱构建超过%已自动停止%')"""
+                ).fetchall()
+            ]
+        for kb_id in legacy_timeout_ids:
+            self.recover_legacy_graph_timeout(kb_id)
 
     def fetch_one(self, sql: str, params: Sequence[Any] = ()) -> dict[str, Any] | None:
         with self.connection() as connection:
@@ -230,19 +321,24 @@ class Database:
         with self.connection() as connection:
             connection.execute(sql, params)
 
-    def create_knowledge_base(self, name: str, description: str) -> dict[str, Any]:
+    def create_knowledge_base(
+        self, name: str, description: str, password: str = ""
+    ) -> dict[str, Any]:
         kb_id = new_id()
         now = utc_now()
+        password_hash = hash_password(password) if password else ""
         with self.connection() as connection:
             connection.execute(
-                "INSERT INTO knowledge_bases(id, name, description, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (kb_id, name, description, now, now),
+                """INSERT INTO knowledge_bases
+                   (id, name, description, password_hash, created_at, updated_at)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (kb_id, name, description, password_hash, now, now),
             )
         return self.get_knowledge_base(kb_id)  # type: ignore[return-value]
 
     def list_knowledge_bases(self) -> list[dict[str, Any]]:
         return self.fetch_all(
-            """SELECT kb.*,
+            f"""SELECT {KB_PUBLIC_COLUMNS},
                       (SELECT COUNT(*) FROM documents d WHERE d.kb_id = kb.id AND d.status = 'ready') AS document_count,
                       (SELECT COUNT(*) FROM chunks c WHERE c.kb_id = kb.id) AS chunk_count,
                       (SELECT COUNT(*) FROM entities e WHERE e.kb_id = kb.id) AS entity_count,
@@ -252,7 +348,7 @@ class Database:
 
     def get_knowledge_base(self, kb_id: str) -> dict[str, Any] | None:
         return self.fetch_one(
-            """SELECT kb.*,
+            f"""SELECT {KB_PUBLIC_COLUMNS},
                       (SELECT COUNT(*) FROM documents d WHERE d.kb_id = kb.id AND d.status = 'ready') AS document_count,
                       (SELECT COUNT(*) FROM chunks c WHERE c.kb_id = kb.id) AS chunk_count,
                       (SELECT COUNT(*) FROM entities e WHERE e.kb_id = kb.id) AS entity_count,
@@ -334,7 +430,8 @@ class Database:
 
     def pending_graph_chunks(self, kb_id: str) -> list[dict[str, Any]]:
         return self.fetch_all(
-            """SELECT c.id, c.content, c.chunk_index, d.filename
+            """SELECT c.id, c.content, c.chunk_index, d.filename,
+                      checkpoint.attempts, checkpoint.error AS checkpoint_error
                FROM graph_build_chunks checkpoint
                JOIN chunks c ON c.id = checkpoint.chunk_id
                JOIN documents d ON d.id = c.document_id
@@ -344,17 +441,48 @@ class Database:
             (kb_id,),
         )
 
+    def verify_knowledge_base_password(self, kb_id: str, password: str) -> bool:
+        row = self.fetch_one("SELECT password_hash FROM knowledge_bases WHERE id = ?", (kb_id,))
+        if not row:
+            return False
+        return verify_password(password, str(row.get("password_hash") or ""))
+
+    def change_knowledge_base_password(
+        self, kb_id: str, old_password: str, new_password: str
+    ) -> bool:
+        row = self.fetch_one("SELECT password_hash FROM knowledge_bases WHERE id = ?", (kb_id,))
+        if not row:
+            return False
+        current_hash = str(row.get("password_hash") or "")
+        if current_hash and not verify_password(old_password, current_hash):
+            return False
+        self.execute(
+            "UPDATE knowledge_bases SET password_hash = ?, updated_at = ? WHERE id = ?",
+            (hash_password(new_password), utc_now(), kb_id),
+        )
+        return True
+
     def resume_graph_build(self, kb_id: str) -> None:
         now = utc_now()
-        self.execute(
-            """UPDATE knowledge_bases
+        with self.connection() as connection:
+            # A paused build keeps terminal failures so the UI can explain them.
+            # Explicit resume makes only those chunks pending again; successful
+            # checkpoints and graph data remain untouched.
+            connection.execute(
+                """UPDATE graph_build_chunks
+                   SET status = 'pending', updated_at = ?
+                   WHERE kb_id = ? AND status = 'failed'""",
+                (now, kb_id),
+            )
+            connection.execute(
+                """UPDATE knowledge_bases
                SET graph_status = 'building', graph_error = NULL,
                    graph_stage = CASE WHEN graph_stage = '' THEN 'queued' ELSE graph_stage END,
                    graph_started_at = COALESCE(graph_started_at, ?),
                    graph_heartbeat_at = ?, updated_at = ?
                WHERE id = ?""",
-            (now, now, now, kb_id),
-        )
+                (now, now, now, kb_id),
+            )
 
     def pause_graph_build(self, kb_id: str, reason: str) -> None:
         now = utc_now()
@@ -369,6 +497,108 @@ class Database:
 
     def clear_graph_checkpoints(self, kb_id: str) -> None:
         self.execute("DELETE FROM graph_build_chunks WHERE kb_id = ?", (kb_id,))
+
+    def recover_legacy_graph_timeout(self, kb_id: str) -> bool:
+        """Convert a pre-checkpoint timeout into a resumable build without clearing graph data."""
+        knowledge_base = self.get_knowledge_base(kb_id)
+        if not knowledge_base:
+            return False
+        error = str(knowledge_base.get("graph_error") or "")
+        checkpoint_stats = self.graph_checkpoint_stats(kb_id)
+        if knowledge_base.get("graph_status") == "paused" and checkpoint_stats["total"]:
+            # The checkpoint table is the source of truth. An older worker may have
+            # written a later in-memory counter immediately before it disappeared,
+            # so reconcile the visible progress before offering Resume.
+            now = utc_now()
+            readable_error = error
+            if not readable_error or any(marker in readable_error for marker in ("æ", "å", "ç", "ï", "�")):
+                readable_error = "图谱构建已暂停；已完成结果和检查点均已保留，可从当前进度继续"
+            self.execute(
+                """UPDATE knowledge_bases
+                   SET graph_progress_current = ?, graph_progress_total = ?,
+                       graph_failed_chunks = ?, graph_error = ?,
+                       graph_stage = CASE WHEN graph_stage = '' THEN 'extracting' ELSE graph_stage END,
+                       graph_heartbeat_at = ?, updated_at = ?
+                   WHERE id = ?""",
+                (
+                    checkpoint_stats["succeeded"],
+                    checkpoint_stats["total"],
+                    max(0, checkpoint_stats["total"] - checkpoint_stats["succeeded"]),
+                    readable_error,
+                    now,
+                    now,
+                    kb_id,
+                ),
+            )
+            return True
+        is_legacy_timeout = (
+            knowledge_base.get("graph_status") == "error"
+            and "图谱构建超过" in error
+            and "自动停止" in error
+        )
+        is_incomplete_ready = (
+            knowledge_base.get("graph_status") == "ready"
+            and int(knowledge_base.get("graph_failed_chunks") or 0) > 0
+        )
+        is_paused_without_checkpoint = (
+            knowledge_base.get("graph_status") == "paused"
+            and not checkpoint_stats["total"]
+        )
+        if not is_legacy_timeout and not is_paused_without_checkpoint and not is_incomplete_ready:
+            return knowledge_base.get("graph_status") == "paused"
+
+        chunks = self.chunks_for_graph(kb_id)
+        if not chunks:
+            return False
+        if not checkpoint_stats["total"]:
+            self.prepare_graph_checkpoints(kb_id, [chunk["id"] for chunk in chunks])
+
+        now = utc_now()
+        with self.connection() as connection:
+            # Old versions did not record processed chunk IDs. An entity mention is a
+            # reliable completed-chunk signal; all other chunks remain pending and may
+            # be safely replayed because entity/relation upserts are idempotent.
+            connection.execute(
+                """UPDATE graph_build_chunks
+                   SET status = 'succeeded', error = NULL, updated_at = ?
+                   WHERE kb_id = ? AND chunk_id IN (
+                       SELECT ec.chunk_id
+                       FROM entity_chunks ec
+                       JOIN entities e ON e.id = ec.entity_id
+                       WHERE e.kb_id = ?
+                   )""",
+                (now, kb_id, kb_id),
+            )
+            checkpoint = connection.execute(
+                """SELECT COUNT(*) AS total,
+                          SUM(CASE WHEN status != 'pending' THEN 1 ELSE 0 END) AS processed
+                   FROM graph_build_chunks WHERE kb_id = ?""",
+                (kb_id,),
+            ).fetchone()
+            total = int(checkpoint["total"] or 0)
+            processed = int(checkpoint["processed"] or 0)
+            recovery_message = (
+                "已将旧版超时任务恢复为可继续状态；现有实体关系已保留，未确认完成的文本块会安全重试"
+                if is_legacy_timeout
+                else (
+                    f"检测到旧版构建有 {int(knowledge_base.get('graph_failed_chunks') or 0)} 个失败块；"
+                    "现有图谱已保留，继续构建会补抽未确认完成的文本块"
+                    if is_incomplete_ready
+                    else "已为中断的旧版任务恢复构建检查点；现有实体关系已保留，未确认完成的文本块会安全重试"
+                )
+            )
+            unresolved = max(0, total - processed)
+            connection.execute(
+                """UPDATE knowledge_bases
+                   SET graph_status = 'paused',
+                       graph_error = ?,
+                       graph_stage = 'extracting', graph_progress_current = ?,
+                       graph_progress_total = ?, graph_failed_chunks = ?,
+                       graph_heartbeat_at = ?, updated_at = ?
+                   WHERE id = ?""",
+                (recovery_message, processed, total, unresolved, now, now, kb_id),
+            )
+        return True
 
     def update_graph_progress(
         self,
@@ -398,14 +628,20 @@ class Database:
         )
 
     def create_document(
-        self, kb_id: str, filename: str, stored_path: str, file_type: str, size_bytes: int
+        self,
+        kb_id: str,
+        filename: str,
+        stored_path: str,
+        file_type: str,
+        size_bytes: int,
+        sha256: str = "",
     ) -> str:
         document_id = new_id()
         self.execute(
             """INSERT INTO documents
-               (id, kb_id, filename, stored_path, file_type, size_bytes, created_at)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (document_id, kb_id, filename, stored_path, file_type, size_bytes, utc_now()),
+               (id, kb_id, filename, stored_path, file_type, size_bytes, sha256, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (document_id, kb_id, filename, stored_path, file_type, size_bytes, sha256, utc_now()),
         )
         return document_id
 
@@ -468,7 +704,7 @@ class Database:
     def list_documents(self, kb_id: str) -> list[dict[str, Any]]:
         return self.fetch_all(
             """SELECT id, kb_id, filename, file_type, size_bytes, chunk_count, status,
-                      extraction_method, page_count, ocr_page_count, warning, error, created_at
+                      sha256, extraction_method, page_count, ocr_page_count, warning, error, created_at
                FROM documents WHERE kb_id = ? ORDER BY created_at DESC""",
             (kb_id,),
         )

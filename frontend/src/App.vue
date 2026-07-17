@@ -10,9 +10,27 @@ import type {
 } from "./types";
 
 type TabName = "home" | "documents" | "chat" | "graph" | "settings";
-type SettingsSection = keyof SettingsUpdate;
+type RuntimeSettingsSection = keyof SettingsUpdate;
+type SettingsSection = RuntimeSettingsSection | "security";
 interface ToastItem { id: number; message: string; type: "success" | "error"; }
 interface UploadResult { documents: Array<{ status: string; error?: string }>; }
+interface UnlockResponse { access_token: string; knowledge_base: KnowledgeBase; }
+interface UploadCandidate {
+  key: string;
+  file: File;
+  filename: string;
+  size_bytes: number;
+  sha256: string;
+}
+interface DuplicateItem {
+  key: string;
+  kind: "existing" | "upload";
+  id?: string;
+  filename: string;
+  size_bytes: number;
+  sha256: string;
+}
+interface DuplicateGroup { sha256: string; items: DuplicateItem[]; }
 
 const knowledgeBases = ref<KnowledgeBase[]>([]);
 const current = ref<KnowledgeBase | null>(null);
@@ -20,7 +38,7 @@ const documents = ref<DocumentItem[]>([]);
 const settings = ref<PublicSettings | null>(null);
 const settingsForm = ref<SettingsUpdate | null>(null);
 const savingSettings = ref(false);
-const savingSettingsSection = ref<SettingsSection | "all" | null>(null);
+const savingSettingsSection = ref<RuntimeSettingsSection | "all" | null>(null);
 const editingSettingsSection = ref<SettingsSection | null>(null);
 const secretVisibility = ref({ embedding: false, chat: false, ocr: false, rerank: false });
 const activeTab = ref<TabName>("home");
@@ -39,7 +57,20 @@ const sending = ref(false);
 const evidence = ref<EvidenceMeta | null>(null);
 const creatingName = ref("");
 const creatingDescription = ref("");
+const creatingPassword = ref("");
+const creatingPasswordConfirm = ref("");
 const createModal = ref<HTMLDialogElement | null>(null);
+const unlockModal = ref<HTMLDialogElement | null>(null);
+const unlockTarget = ref<KnowledgeBase | null>(null);
+const unlockPassword = ref("");
+const unlocking = ref(false);
+const kbTokens = ref<Record<string, string>>({});
+const securityForm = ref({ old_password: "", new_password: "", confirm_password: "" });
+const savingPassword = ref(false);
+const duplicateModal = ref<HTMLDialogElement | null>(null);
+const duplicateGroups = ref<DuplicateGroup[]>([]);
+const duplicateSelections = ref<Record<string, boolean>>({});
+let pendingUploadCandidates: UploadCandidate[] = [];
 const fileInput = ref<HTMLInputElement | null>(null);
 const messagesElement = ref<HTMLElement | null>(null);
 const dragging = ref(false);
@@ -56,6 +87,7 @@ const markdown = new MarkdownIt({ html: false, linkify: true, breaks: true });
 const graphStageLabels: Record<string, string> = {
   queued: "准备构建",
   extracting: "抽取实体关系",
+  retrying: "降并发重试失败块",
   communities: "生成图社区",
   embedding: "生成社区向量",
   completed: "图谱已构建",
@@ -71,7 +103,7 @@ const tabs: Array<{ key: TabName; label: string; index: string }> = [
   { key: "graph", label: "知识图谱", index: "04" },
   { key: "settings", label: "配置", index: "05" },
 ];
-const settingsSectionLabels: Record<SettingsSection, string> = {
+const settingsSectionLabels: Record<RuntimeSettingsSection, string> = {
   embedding: "Embedding",
   chat: "Chat / Graph",
   ocr: "OCR",
@@ -79,11 +111,12 @@ const settingsSectionLabels: Record<SettingsSection, string> = {
   chunking: "Chunking",
   graph: "GraphRAG",
 };
-const settingsSections = Object.keys(settingsSectionLabels) as SettingsSection[];
+const settingsSections = Object.keys(settingsSectionLabels) as RuntimeSettingsSection[];
 
 const graphInfo = computed(() => {
   const status = current.value?.graph_status || "empty";
   if (status === "building") return [graphProgressLabel(current.value), "building"] as [string, string];
+  if (isGraphResumable(current.value)) return ["图谱构建已暂停", "paused"] as [string, string];
   return ({
     empty: ["图谱未构建", ""], stale: ["图谱待更新", ""], building: ["图谱构建中", "building"],
     paused: ["图谱构建已暂停", "paused"], ready: ["图谱已就绪", "ready"],
@@ -97,6 +130,13 @@ const graphProgressPercent = computed(() => {
   return total ? Math.min(100, Math.round((value / total) * 100)) : 0;
 });
 const landingDocumentCount = computed(() => knowledgeBases.value.reduce((total, kb) => total + kb.document_count, 0));
+
+function isGraphResumable(kb: KnowledgeBase | null) {
+  if (!kb) return false;
+  if (kb.graph_status === "paused") return true;
+  const error = kb.graph_error || "";
+  return kb.graph_status === "error" && error.includes("图谱构建超过") && error.includes("自动停止");
+}
 
 function graphProgressLabel(kb: KnowledgeBase | null) {
   if (!kb) return "图谱构建中";
@@ -160,6 +200,60 @@ function extractionLabel(document: DocumentItem) {
   return "等待解析";
 }
 
+function kbHasPassword(kb: KnowledgeBase | null) {
+  return Boolean(kb?.has_password);
+}
+
+function kbToken(kbId: string) {
+  return kbTokens.value[kbId] || "";
+}
+
+function rememberKbToken(kbId: string, token?: string) {
+  if (!token) return;
+  kbTokens.value = { ...kbTokens.value, [kbId]: token };
+}
+
+function kbRequestOptions(kbId: string, options: RequestInit = {}): RequestInit {
+  const headers = new Headers(options.headers);
+  const token = kbToken(kbId);
+  if (token) headers.set("X-Ingot-KB-Token", token);
+  return { ...options, headers };
+}
+
+function kbApi<T>(kbId: string, path: string, options: RequestInit = {}) {
+  return api<T>(path, kbRequestOptions(kbId, options));
+}
+
+function isUnlockRequiredError(error: unknown) {
+  return error instanceof Error && error.message.includes("请先输入密码解锁知识库");
+}
+
+async function requestKnowledgeBaseUnlock(kbId: string) {
+  const target = knowledgeBases.value.find(kb => kb.id === kbId)
+    || (current.value?.id === kbId ? current.value : null);
+  if (!target) return false;
+  delete kbTokens.value[kbId];
+  if (current.value?.id === kbId) {
+    current.value = null;
+    documents.value = [];
+    graph.value = null;
+    evidence.value = null;
+    chatTurns.value = [];
+    showLanding.value = true;
+  }
+  if (!(unlockModal.value?.open && unlockTarget.value?.id === kbId)) {
+    await openUnlockModal(target);
+  }
+  return true;
+}
+
+async function handleKnowledgeBaseAccessError(kbId: string, error: unknown) {
+  if (!isUnlockRequiredError(error)) return false;
+  await requestKnowledgeBaseUnlock(kbId);
+  notify("请重新输入密码后继续操作", "error");
+  return true;
+}
+
 async function loadHealth() {
   try {
     await api<{ status: string }>("/api/health");
@@ -184,6 +278,7 @@ function settingsToForm(value: PublicSettings): SettingsUpdate {
       timeout: value.chat_timeout,
       temperature: value.chat_temperature,
       max_tokens: value.chat_max_tokens,
+      evidence_count: value.qa_evidence_count,
     },
     ocr: {
       enabled: value.ocr_enabled,
@@ -216,6 +311,8 @@ function settingsToForm(value: PublicSettings): SettingsUpdate {
       max_chunks: value.graph_max_chunks,
       chunk_timeout: value.graph_chunk_timeout,
       build_timeout: value.graph_build_timeout,
+      retry_rounds: value.graph_retry_rounds,
+      retry_backoff: value.graph_retry_backoff,
     },
   };
 }
@@ -238,7 +335,7 @@ function secretPlaceholder(configured: boolean, inherited = false) {
   return configured ? "••••••••（已配置，留空保留）" : "输入 API Key";
 }
 
-function hideSectionSecret(section: SettingsSection) {
+function hideSectionSecret(section: RuntimeSettingsSection) {
   if (section === "embedding" || section === "chat" || section === "ocr" || section === "rerank") {
     secretVisibility.value[section] = false;
   }
@@ -249,6 +346,11 @@ function beginSettingsEdit(section: SettingsSection) {
 }
 
 function discardSettingsSection(section: SettingsSection) {
+  if (section === "security") {
+    securityForm.value = { old_password: "", new_password: "", confirm_password: "" };
+    if (editingSettingsSection.value === section) editingSettingsSection.value = null;
+    return;
+  }
   if (!settings.value || !settingsForm.value) return;
   const savedForm = settingsToForm(settings.value);
   Object.assign(settingsForm.value[section], savedForm[section]);
@@ -268,7 +370,7 @@ function cloneSettingsForm(value: SettingsUpdate): SettingsUpdate {
   return JSON.parse(JSON.stringify(value)) as SettingsUpdate;
 }
 
-async function saveSettings(section?: SettingsSection) {
+async function saveSettings(section?: RuntimeSettingsSection) {
   if (!settingsForm.value || savingSettings.value) return;
   const editedForm = cloneSettingsForm(settingsForm.value);
   const payload = section && settings.value ? settingsToForm(settings.value) : cloneSettingsForm(editedForm);
@@ -305,22 +407,81 @@ async function saveSettings(section?: SettingsSection) {
   }
 }
 
+async function saveKnowledgeBasePassword() {
+  if (!current.value || savingPassword.value) return;
+  const kbId = current.value.id;
+  if (!securityForm.value.new_password.trim()) {
+    notify("新密码不能为空", "error");
+    return;
+  }
+  if (securityForm.value.new_password !== securityForm.value.confirm_password) {
+    notify("两次输入的新密码不一致", "error");
+    return;
+  }
+  savingPassword.value = true;
+  try {
+    const response = await kbApi<UnlockResponse>(
+      kbId,
+      `/api/knowledge-bases/${kbId}/password`,
+      {
+        method: "PUT",
+        body: JSON.stringify({
+          old_password: securityForm.value.old_password,
+          new_password: securityForm.value.new_password,
+        }),
+      },
+    );
+    rememberKbToken(kbId, response.access_token);
+    current.value = response.knowledge_base;
+    securityForm.value = { old_password: "", new_password: "", confirm_password: "" };
+    editingSettingsSection.value = null;
+    notify("知识库密码已更新");
+  } catch (error) {
+    if (await handleKnowledgeBaseAccessError(kbId, error)) return;
+    notify((error as Error).message, "error");
+  } finally {
+    savingPassword.value = false;
+  }
+}
+
 async function loadKnowledgeBases(preferredId?: string) {
   knowledgeBases.value = await api<KnowledgeBase[]>("/api/knowledge-bases");
-  const target = preferredId || current.value?.id || knowledgeBases.value[0]?.id;
-  if (target && knowledgeBases.value.some(kb => kb.id === target)) await selectKnowledgeBase(target, false);
-  else { current.value = null; documents.value = []; }
+  const target = preferredId || current.value?.id;
+  const targetKb = knowledgeBases.value.find(kb => kb.id === target);
+  if (targetKb && (!kbHasPassword(targetKb) || kbToken(targetKb.id))) {
+    await selectKnowledgeBase(targetKb.id, false);
+  } else if (!current.value) {
+    documents.value = [];
+    showLanding.value = true;
+  }
   scheduleAutoRefresh();
 }
 
 async function selectKnowledgeBase(id: string, resetTab = true) {
   window.clearTimeout(autoRefreshTimer);
-  const [kb, docs] = await Promise.all([
-    api<KnowledgeBase>(`/api/knowledge-bases/${id}`),
-    api<DocumentItem[]>(`/api/knowledge-bases/${id}/documents`),
-  ]);
+  const listed = knowledgeBases.value.find(kb => kb.id === id);
+  if (listed && kbHasPassword(listed) && !kbToken(id)) {
+    openUnlockModal(listed);
+    scheduleAutoRefresh();
+    return;
+  }
+  let kb: KnowledgeBase;
+  let docs: DocumentItem[];
+  try {
+    [kb, docs] = await Promise.all([
+      kbApi<KnowledgeBase>(id, `/api/knowledge-bases/${id}`),
+      kbApi<DocumentItem[]>(id, `/api/knowledge-bases/${id}/documents`),
+    ]);
+  } catch (error) {
+    if (await handleKnowledgeBaseAccessError(id, error)) {
+      scheduleAutoRefresh();
+      return;
+    }
+    throw error;
+  }
   current.value = kb;
   documents.value = docs;
+  securityForm.value = { old_password: "", new_password: "", confirm_password: "" };
   showLanding.value = false;
   graph.value = null;
   chatTurns.value = [];
@@ -337,18 +498,62 @@ function openLanding() {
 async function refreshCurrent() {
   if (!current.value) return;
   const id = current.value.id;
-  const [kb, docs, list] = await Promise.all([
-    api<KnowledgeBase>(`/api/knowledge-bases/${id}`),
-    api<DocumentItem[]>(`/api/knowledge-bases/${id}/documents`),
-    api<KnowledgeBase[]>("/api/knowledge-bases"),
-  ]);
+  let kb: KnowledgeBase;
+  let docs: DocumentItem[];
+  let list: KnowledgeBase[];
+  try {
+    [kb, docs, list] = await Promise.all([
+      kbApi<KnowledgeBase>(id, `/api/knowledge-bases/${id}`),
+      kbApi<DocumentItem[]>(id, `/api/knowledge-bases/${id}/documents`),
+      api<KnowledgeBase[]>("/api/knowledge-bases"),
+    ]);
+  } catch (error) {
+    if (await handleKnowledgeBaseAccessError(id, error)) return;
+    throw error;
+  }
   if (current.value?.id !== id) return;
   current.value = kb; documents.value = docs; knowledgeBases.value = list;
+}
+
+async function openUnlockModal(kb: KnowledgeBase) {
+  unlockTarget.value = kb;
+  unlockPassword.value = "";
+  await nextTick();
+  if (!unlockModal.value?.open) unlockModal.value?.showModal();
+  if (toasts.value.length) showToastLayer(true);
+}
+
+function closeUnlockModal() {
+  unlockPassword.value = "";
+  unlocking.value = false;
+  unlockTarget.value = null;
+  unlockModal.value?.close();
+}
+
+async function unlockKnowledgeBase() {
+  if (!unlockTarget.value || !unlockPassword.value || unlocking.value) return;
+  const target = unlockTarget.value;
+  unlocking.value = true;
+  try {
+    const response = await api<UnlockResponse>(`/api/knowledge-bases/${target.id}/unlock`, {
+      method: "POST",
+      body: JSON.stringify({ password: unlockPassword.value }),
+    });
+    rememberKbToken(target.id, response.access_token);
+    closeUnlockModal();
+    await selectKnowledgeBase(target.id);
+  } catch (error) {
+    notify((error as Error).message, "error");
+  } finally {
+    unlocking.value = false;
+  }
 }
 
 async function openCreateModal() {
   creatingName.value = "";
   creatingDescription.value = "";
+  creatingPassword.value = "";
+  creatingPasswordConfirm.value = "";
   await nextTick();
   createModal.value?.showModal();
   if (toasts.value.length) showToastLayer(true);
@@ -357,16 +562,31 @@ async function openCreateModal() {
 function closeCreateModal() {
   creatingName.value = "";
   creatingDescription.value = "";
+  creatingPassword.value = "";
+  creatingPasswordConfirm.value = "";
   createModal.value?.close();
 }
 
 async function createKnowledgeBase() {
   if (!creatingName.value.trim()) return;
+  if (!creatingPassword.value.trim()) {
+    notify("请设置知识库访问密码", "error");
+    return;
+  }
+  if (creatingPassword.value !== creatingPasswordConfirm.value) {
+    notify("两次输入的密码不一致", "error");
+    return;
+  }
   try {
     const kb = await api<KnowledgeBase>("/api/knowledge-bases", {
       method: "POST",
-      body: JSON.stringify({ name: creatingName.value.trim(), description: creatingDescription.value.trim() }),
+      body: JSON.stringify({
+        name: creatingName.value.trim(),
+        description: creatingDescription.value.trim(),
+        password: creatingPassword.value,
+      }),
     });
+    rememberKbToken(kb.id, kb.access_token);
     closeCreateModal();
     await loadKnowledgeBases(kb.id);
     activeTab.value = "home";
@@ -376,37 +596,175 @@ async function createKnowledgeBase() {
 
 async function deleteKnowledgeBase() {
   if (!current.value || !window.confirm(`确定删除知识库「${current.value.name}」及其全部文档和图谱吗？此操作不可撤销。`)) return;
+  const kbId = current.value.id;
   try {
-    await api<void>(`/api/knowledge-bases/${current.value.id}`, { method: "DELETE" });
+    await kbApi<void>(kbId, `/api/knowledge-bases/${kbId}`, { method: "DELETE" });
+    delete kbTokens.value[kbId];
     current.value = null;
     await loadKnowledgeBases();
     activeTab.value = "home";
     notify("知识库已删除");
-  } catch (error) { notify((error as Error).message, "error"); }
+  } catch (error) {
+    if (await handleKnowledgeBaseAccessError(kbId, error)) return;
+    notify((error as Error).message, "error");
+  }
 }
 
 async function deleteDocument(id: string) {
   if (!current.value || !window.confirm("确定删除这份文档及其全部文本块吗？")) return;
+  const kbId = current.value.id;
   try {
-    await api<void>(`/api/knowledge-bases/${current.value.id}/documents/${id}`, { method: "DELETE" });
+    await kbApi<void>(kbId, `/api/knowledge-bases/${kbId}/documents/${id}`, { method: "DELETE" });
     await refreshCurrent();
     notify("文档已删除；图谱需要重新构建");
-  } catch (error) { notify((error as Error).message, "error"); }
+  } catch (error) {
+    if (await handleKnowledgeBaseAccessError(kbId, error)) return;
+    notify((error as Error).message, "error");
+  }
 }
 
-async function uploadFiles(files: FileList | File[]) {
-  if (!current.value || !files.length || uploading.value) return;
+async function fileSha256(file: File) {
+  const buffer = await file.arrayBuffer();
+  const digest = await crypto.subtle.digest("SHA-256", buffer);
+  return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function prepareUploadCandidates(files: FileList | File[]) {
+  return Promise.all(Array.from(files).map(async (file, index): Promise<UploadCandidate> => {
+    const sha256 = await fileSha256(file);
+    return {
+      key: `upload:${index}:${file.name}:${file.size}:${sha256}`,
+      file,
+      filename: file.name,
+      size_bytes: file.size,
+      sha256,
+    };
+  }));
+}
+
+function buildDuplicateGroups(candidates: UploadCandidate[]): DuplicateGroup[] {
+  const byHash = new Map<string, DuplicateItem[]>();
+  for (const document of documents.value) {
+    if (!document.sha256) continue;
+    const items = byHash.get(document.sha256) || [];
+    items.push({
+      key: `existing:${document.id}`,
+      kind: "existing",
+      id: document.id,
+      filename: document.filename,
+      size_bytes: document.size_bytes,
+      sha256: document.sha256,
+    });
+    byHash.set(document.sha256, items);
+  }
+  for (const candidate of candidates) {
+    const items = byHash.get(candidate.sha256) || [];
+    items.push({
+      key: candidate.key,
+      kind: "upload",
+      filename: candidate.filename,
+      size_bytes: candidate.size_bytes,
+      sha256: candidate.sha256,
+    });
+    byHash.set(candidate.sha256, items);
+  }
+  return Array.from(byHash.entries())
+    .map(([sha256, items]) => ({ sha256, items }))
+    .filter(group => group.items.length > 1 && group.items.some(item => item.kind === "upload"));
+}
+
+async function uploadCandidates(candidates: UploadCandidate[]) {
+  if (!current.value || !candidates.length) return;
+  const kbId = current.value.id;
   const form = new FormData();
-  Array.from(files).forEach(file => form.append("files", file));
+  candidates.forEach(candidate => form.append("files", candidate.file));
   uploading.value = true;
   try {
-    const result = await api<UploadResult>(`/api/knowledge-bases/${current.value.id}/documents`, { method: "POST", body: form });
+    const result = await kbApi<UploadResult>(kbId, `/api/knowledge-bases/${kbId}/documents`, { method: "POST", body: form });
     const failed = result.documents.filter(item => item.status === "error");
     if (failed.length) notify(`${failed.length} 个文件处理失败：${failed[0]?.error || "未知错误"}`, "error");
     else notify(`${result.documents.length} 个文件已完成解析和索引`);
     await refreshCurrent();
-  } catch (error) { notify((error as Error).message, "error"); }
+  } catch (error) {
+    if (await handleKnowledgeBaseAccessError(kbId, error)) return;
+    notify((error as Error).message, "error");
+  }
   finally { uploading.value = false; if (fileInput.value) fileInput.value.value = ""; }
+}
+
+async function uploadFiles(files: FileList | File[]) {
+  if (!current.value || !files.length || uploading.value) return;
+  if (!crypto.subtle) {
+    notify("当前浏览器不支持上传前 SHA256 检测", "error");
+    return;
+  }
+  uploading.value = true;
+  try {
+    const candidates = await prepareUploadCandidates(files);
+    const groups = buildDuplicateGroups(candidates);
+    if (groups.length) {
+      pendingUploadCandidates = candidates;
+      duplicateGroups.value = groups;
+      duplicateSelections.value = {};
+      await nextTick();
+      duplicateModal.value?.showModal();
+      uploading.value = false;
+      return;
+    }
+    uploading.value = false;
+    await uploadCandidates(candidates);
+  } catch (error) {
+    uploading.value = false;
+    notify((error as Error).message, "error");
+    if (fileInput.value) fileInput.value.value = "";
+  }
+}
+
+function closeDuplicateModal() {
+  duplicateModal.value?.close();
+  duplicateGroups.value = [];
+  duplicateSelections.value = {};
+  pendingUploadCandidates = [];
+  if (fileInput.value) fileInput.value.value = "";
+}
+
+function setAllDuplicateSelections(value: boolean) {
+  const next: Record<string, boolean> = {};
+  for (const group of duplicateGroups.value) {
+    for (const item of group.items) next[item.key] = value;
+  }
+  duplicateSelections.value = next;
+}
+
+async function confirmDuplicateResolution() {
+  if (!current.value) return;
+  const kbId = current.value.id;
+  const duplicateKeys = new Set(duplicateGroups.value.flatMap(group => group.items.map(item => item.key)));
+  const existingToDelete = duplicateGroups.value
+    .flatMap(group => group.items)
+    .filter(item => item.kind === "existing" && item.id && !duplicateSelections.value[item.key]);
+  const candidatesToUpload = pendingUploadCandidates.filter(candidate => (
+    !duplicateKeys.has(candidate.key) || duplicateSelections.value[candidate.key]
+  ));
+  closeDuplicateModal();
+  uploading.value = true;
+  try {
+    for (const item of existingToDelete) {
+      await kbApi<void>(
+        kbId,
+        `/api/knowledge-bases/${kbId}/documents/${item.id}`,
+        { method: "DELETE" },
+      );
+    }
+    uploading.value = false;
+    if (candidatesToUpload.length) await uploadCandidates(candidatesToUpload);
+    else await refreshCurrent();
+    notify("重复文件处理完成");
+  } catch (error) {
+    uploading.value = false;
+    if (await handleKnowledgeBaseAccessError(kbId, error)) return;
+    notify((error as Error).message, "error");
+  }
 }
 
 function handleDrop(event: DragEvent) {
@@ -421,8 +779,9 @@ function handleFileInput(event: Event) {
 
 async function buildGraph() {
   if (!current.value) return;
+  const kbId = current.value.id;
   try {
-    await api(`/api/knowledge-bases/${current.value.id}/graph/rebuild`, { method: "POST" });
+    await kbApi(kbId, `/api/knowledge-bases/${kbId}/graph/rebuild`, { method: "POST" });
     current.value.graph_status = "building";
     current.value.graph_stage = "queued";
     current.value.graph_progress_current = 0;
@@ -433,27 +792,38 @@ async function buildGraph() {
     current.value.graph_failed_chunks = 0;
     notify("GraphRAG 构建已启动");
     scheduleAutoRefresh(250);
-  } catch (error) { notify((error as Error).message, "error"); }
+  } catch (error) {
+    if (await handleKnowledgeBaseAccessError(kbId, error)) return;
+    notify((error as Error).message, "error");
+  }
 }
 
 async function resumeGraph() {
   if (!current.value) return;
+  const kbId = current.value.id;
   try {
-    await api(`/api/knowledge-bases/${current.value.id}/graph/resume`, { method: "POST" });
+    await kbApi(kbId, `/api/knowledge-bases/${kbId}/graph/resume`, { method: "POST" });
     current.value.graph_status = "building";
     notify("GraphRAG 已从检查点继续构建");
     scheduleAutoRefresh(250);
-  } catch (error) { notify((error as Error).message, "error"); }
+  } catch (error) {
+    if (await handleKnowledgeBaseAccessError(kbId, error)) return;
+    notify((error as Error).message, "error");
+  }
 }
 
 async function stopGraph() {
   if (!current.value || !window.confirm("确定停止当前 GraphRAG 构建吗？部分结果与检查点会被清空，下次构建将从零开始。")) return;
+  const kbId = current.value.id;
   try {
-    await api(`/api/knowledge-bases/${current.value.id}/graph/cancel`, { method: "POST" });
+    await kbApi(kbId, `/api/knowledge-bases/${kbId}/graph/cancel`, { method: "POST" });
     await refreshCurrent();
     notify("GraphRAG 构建已停止；下次将从零开始");
     scheduleAutoRefresh(250);
-  } catch (error) { notify((error as Error).message, "error"); }
+  } catch (error) {
+    if (await handleKnowledgeBaseAccessError(kbId, error)) return;
+    notify((error as Error).message, "error");
+  }
 }
 
 function graphSnapshot(kb: KnowledgeBase) {
@@ -491,8 +861,8 @@ async function syncWorkspace() {
     if (!current.value) {
       const list = await api<KnowledgeBase[]>("/api/knowledge-bases");
       knowledgeBases.value = list;
-      const firstKnowledgeBase = list[0];
-      if (firstKnowledgeBase) await selectKnowledgeBase(firstKnowledgeBase.id, false);
+      const firstAccessible = list.find(kb => !kbHasPassword(kb) || kbToken(kb.id));
+      if (firstAccessible) await selectKnowledgeBase(firstAccessible.id, false);
       apiOnline.value = true;
       autoRefreshFailures = 0;
       return;
@@ -504,11 +874,11 @@ async function syncWorkspace() {
     let kb: KnowledgeBase;
 
     if (previousStatus === "building") {
-      kb = await api<KnowledgeBase>(`/api/knowledge-bases/${id}`);
+      kb = await kbApi<KnowledgeBase>(id, `/api/knowledge-bases/${id}`);
     } else {
       const [nextKnowledgeBase, docs, list] = await Promise.all([
-        api<KnowledgeBase>(`/api/knowledge-bases/${id}`),
-        api<DocumentItem[]>(`/api/knowledge-bases/${id}/documents`),
+        kbApi<KnowledgeBase>(id, `/api/knowledge-bases/${id}`),
+        kbApi<DocumentItem[]>(id, `/api/knowledge-bases/${id}/documents`),
         api<KnowledgeBase[]>("/api/knowledge-bases"),
       ]);
       kb = nextKnowledgeBase;
@@ -540,6 +910,11 @@ async function syncWorkspace() {
       await loadGraph();
     }
   } catch (error) {
+    if (current.value && await handleKnowledgeBaseAccessError(current.value.id, error)) {
+      apiOnline.value = true;
+      autoRefreshFailures = 0;
+      return;
+    }
     apiOnline.value = false;
     autoRefreshFailures += 1;
     if (autoRefreshFailures === 3) {
@@ -592,8 +967,12 @@ function handleGraphFullscreenKeydown(event: KeyboardEvent) {
 
 async function loadGraph() {
   if (!current.value) return;
-  try { graph.value = await api<GraphData>(`/api/knowledge-bases/${current.value.id}/graph?limit=300`); }
-  catch (error) { notify((error as Error).message, "error"); }
+  const kbId = current.value.id;
+  try { graph.value = await kbApi<GraphData>(kbId, `/api/knowledge-bases/${kbId}/graph?limit=300`); }
+  catch (error) {
+    if (await handleKnowledgeBaseAccessError(kbId, error)) return;
+    notify((error as Error).message, "error");
+  }
 }
 
 async function scrollMessages() {
@@ -604,6 +983,7 @@ async function scrollMessages() {
 async function sendChat() {
   const query = chatInput.value.trim();
   if (!query || !current.value || sending.value) return;
+  const kbId = current.value.id;
   const history = chatTurns.value.slice(-20).map(turn => ({ ...turn }));
   chatTurns.value.push({ role: "user", content: query });
   const answer: ChatTurn = { role: "assistant", content: "" };
@@ -612,9 +992,18 @@ async function sendChat() {
   sending.value = true;
   await scrollMessages();
   try {
-    const response = await fetch(`/api/knowledge-bases/${current.value.id}/chat`, {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ query, mode: retrievalMode.value, top_k: settings.value?.default_top_k || 6, history }),
+    const response = await fetch(`/api/knowledge-bases/${kbId}/chat`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(kbToken(kbId) ? { "X-Ingot-KB-Token": kbToken(kbId) } : {}),
+      },
+      body: JSON.stringify({
+        query,
+        mode: retrievalMode.value,
+        top_k: settings.value?.qa_evidence_count || settings.value?.default_top_k || 6,
+        history,
+      }),
     });
     if (!response.ok) {
       const payload = await response.json() as { detail?: string };
@@ -647,6 +1036,10 @@ async function sendChat() {
       if (done) break;
     }
   } catch (error) {
+    if (await handleKnowledgeBaseAccessError(kbId, error)) {
+      answer.content = "请先解锁知识库后重试。";
+      return;
+    }
     answer.content = `请求失败：${(error as Error).message}`;
     notify((error as Error).message, "error");
   } finally { sending.value = false; }
@@ -744,7 +1137,7 @@ onBeforeUnmount(() => {
                 <span>01 / INGEST</span><strong>{{ current.document_count ? `管理 ${current.document_count} 份资料` : "导入第一批资料" }}</strong><p>上传 PDF、Office 文档、Markdown 或扫描图片，自动解析、OCR、切分并建立向量索引。</p><b>前往文档 →</b>
               </button>
               <button class="guidance-card" @click="activeTab = current.graph_status === 'ready' ? 'graph' : 'documents'">
-                <span>02 / GRAPHRAG</span><strong>{{ current.graph_status === "building" ? graphProgressLabel(current) : current.graph_status === "paused" ? "继续构建知识图谱" : current.graph_status === "ready" ? "浏览实体关系" : current.graph_status === "error" ? "检查并重新构建" : "构建知识图谱" }}</strong><p>从文本块提取实体与关系，形成可缩放、可拖动的关系网络和全局主题社区。</p><b>{{ current.graph_status === "ready" ? "打开图谱" : "查看构建入口" }} →</b>
+                <span>02 / GRAPHRAG</span><strong>{{ current.graph_status === "building" ? graphProgressLabel(current) : isGraphResumable(current) ? "继续构建知识图谱" : current.graph_status === "ready" ? "浏览实体关系" : current.graph_status === "error" ? "检查并重新构建" : "构建知识图谱" }}</strong><p>从文本块提取实体与关系，形成可缩放、可拖动的关系网络和全局主题社区。</p><b>{{ current.graph_status === "ready" ? "打开图谱" : "查看构建入口" }} →</b>
               </button>
               <button class="guidance-card" @click="activeTab = current.chunk_count ? 'chat' : 'documents'">
                 <span>03 / ASK</span><strong>基于证据开始问答</strong><p>使用向量、图谱局部、图谱全局或混合检索；回答会附带命中的原文与关系证据。</p><b>{{ current.chunk_count ? "开始提问" : "先导入资料" }} →</b>
@@ -757,14 +1150,14 @@ onBeforeUnmount(() => {
         </section>
 
         <section v-show="activeTab === 'documents'" id="panel-documents" class="tab-panel" :class="{ active: activeTab === 'documents' }">
-          <div class="section-heading"><div><p class="eyebrow">INGESTION PIPELINE</p><h2>构建知识底座</h2><p>原生文本优先；图片和低文本密度 PDF 页面自动进入 OCR，再执行切分、向量化与索引。</p></div><div class="graph-build-actions"><button v-if="current.graph_status === 'building' || current.graph_status === 'paused'" class="button button-ghost button-stop" @click="stopGraph"><span class="button-icon">■</span>停止构建</button><button class="button button-secondary" :disabled="!current.chunk_count || current.graph_status === 'building'" @click="current.graph_status === 'paused' ? resumeGraph() : buildGraph()"><span class="button-icon">{{ current.graph_status === "paused" ? "↻" : "⌘" }}</span>{{ current.graph_status === "building" ? "正在构建…" : current.graph_status === "paused" ? "继续构建" : "构建 GraphRAG" }}</button></div></div>
+          <div class="section-heading"><div><p class="eyebrow">INGESTION PIPELINE</p><h2>构建知识底座</h2><p>原生文本优先；图片和低文本密度 PDF 页面自动进入 OCR，再执行切分、向量化与索引。</p></div><div class="graph-build-actions"><button v-if="current.graph_status === 'building' || isGraphResumable(current)" class="button button-ghost button-stop" @click="stopGraph"><span class="button-icon">■</span>停止构建</button><button class="button button-secondary" :disabled="!current.chunk_count || current.graph_status === 'building'" @click="isGraphResumable(current) ? resumeGraph() : buildGraph()"><span class="button-icon">{{ isGraphResumable(current) ? "↻" : "⌘" }}</span>{{ current.graph_status === "building" ? "正在构建…" : isGraphResumable(current) ? "继续构建" : "构建 GraphRAG" }}</button></div></div>
           <div class="pipeline-strip"><span><i>01</i> 文档解析</span><b>→</b><span><i>02</i> OCR fallback</span><b>→</b><span><i>03</i> Chunk + Embed</span><b>→</b><span><i>04</i> Rerank / Graph</span></div>
-          <div v-if="current.graph_status === 'error'" class="graph-build-alert"><strong>上次图谱构建未完成</strong><span>{{ current.graph_error || "未知错误，可重新发起构建。" }}</span></div>
-          <div v-else-if="current.graph_status === 'paused'" class="graph-build-alert graph-build-paused"><strong>图谱构建已暂停</strong><span>{{ current.graph_error || "已完成结果与检查点均已保留，可调整配置后继续构建。" }}</span></div>
+          <div v-if="isGraphResumable(current)" class="graph-build-alert graph-build-paused"><strong>图谱构建已暂停</strong><span>{{ current.graph_status === "paused" ? current.graph_error : "检测到旧版超时任务；点击继续后会保留现有实体关系，并仅重试尚未确认完成的文本块。" }}</span></div>
+          <div v-else-if="current.graph_status === 'error'" class="graph-build-alert"><strong>上次图谱构建未完成</strong><span>{{ current.graph_error || "未知错误，可重新发起构建。" }}</span></div>
           <div v-else-if="current.graph_status === 'stale' && current.graph_error" class="graph-build-alert graph-build-stale"><strong>图谱需要重新构建</strong><span>{{ current.graph_error }}</span></div>
-          <div v-if="current.graph_status === 'building' || current.graph_status === 'paused'" class="graph-build-progress" :class="{ paused: current.graph_status === 'paused' }" role="progressbar" :aria-valuenow="graphProgressPercent" aria-valuemin="0" aria-valuemax="100">
+          <div v-if="current.graph_status === 'building' || isGraphResumable(current)" class="graph-build-progress" :class="{ paused: isGraphResumable(current) }" role="progressbar" :aria-valuenow="graphProgressPercent" aria-valuemin="0" aria-valuemax="100">
             <div><strong>{{ graphProgressLabel(current) }}</strong><span>{{ graphProgressPercent }}%</span></div>
-            <p v-if="current.graph_failed_chunks">{{ current.graph_failed_chunks }} 个文本块抽取失败，任务会继续处理其余内容。</p>
+            <p v-if="current.graph_failed_chunks">{{ current.graph_status === "paused" ? `${current.graph_failed_chunks} 个文本块尚未完成；点击继续构建会从检查点处理。` : current.graph_stage === "retrying" ? `${current.graph_failed_chunks} 个文本块正在降并发重试。` : `${current.graph_failed_chunks} 个文本块暂未成功，稍后会自动重试。` }}</p>
             <div class="graph-progress-track"><span :style="{ width: `${graphProgressPercent}%` }" /></div>
           </div>
           <div class="upload-zone" :class="{ dragging }" @click="fileInput?.click()" @dragenter.prevent="dragging = true" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="handleDrop">
@@ -804,7 +1197,11 @@ onBeforeUnmount(() => {
             <div class="graph-actions">
               <label class="search-box">⌕<input v-model="graphSearch" placeholder="查找实体"></label>
               <button class="button button-secondary graph-refresh-button" @click="loadGraph">刷新</button>
-              <button class="button button-ghost graph-fullscreen-button" type="button" :title="graphFullscreen ? '退出全屏（Esc）' : '全屏查看图谱'" @click="toggleGraphFullscreen"><span aria-hidden="true">{{ graphFullscreen ? "↙" : "⛶" }}</span>{{ graphFullscreen ? "退出全屏" : "全屏" }}</button>
+              <button class="button button-ghost graph-fullscreen-button" type="button" :title="graphFullscreen ? '退出全屏（Esc）' : '全屏查看图谱'" @click="toggleGraphFullscreen">
+                <svg v-if="graphFullscreen" aria-hidden="true" viewBox="0 0 24 24"><path d="M3 8h5V3M21 8h-5V3M21 16h-5v5M3 16h5v5" /></svg>
+                <svg v-else aria-hidden="true" viewBox="0 0 24 24"><path d="M8 3H3v5M16 3h5v5M21 16v5h-5M8 21H3v-5" /></svg>
+                {{ graphFullscreen ? "退出全屏" : "全屏" }}
+              </button>
             </div>
           </div>
           <div class="graph-layout"><GraphCanvas :nodes="graph?.nodes || []" :edges="graph?.edges || []" :search="graphSearch" /><aside class="community-panel"><div class="evidence-head"><span>图社区</span><small>GLOBAL INDEX</small></div><div class="community-list"><div v-if="!graph?.communities.length" class="evidence-empty">构建完成后，这里会显示用于全局检索的主题社区。</div><article v-for="(community, index) in graph?.communities" :key="community.id" class="community-card"><span>COMMUNITY {{ String(index + 1).padStart(2, "0") }} · {{ community.member_count }} ENTITIES</span><strong>{{ community.title }}</strong><p>{{ community.summary }}</p></article></div></aside></div>
@@ -840,6 +1237,7 @@ onBeforeUnmount(() => {
                   <label class="config-field config-field-wide"><span>API Key <small>不回显</small></span><div class="secret-input"><input v-model="settingsForm.chat.api_key" :type="secretVisibility.chat ? 'text' : 'password'" autocomplete="new-password" :disabled="settingsForm.chat.use_embedding_provider" :placeholder="secretPlaceholder(settings.chat_configured, settingsForm.chat.use_embedding_provider)"><button type="button" :disabled="settingsForm.chat.use_embedding_provider" @click="secretVisibility.chat = !secretVisibility.chat">{{ secretVisibility.chat ? "隐藏" : "显示" }}</button></div></label>
                   <label class="config-field"><span>温度</span><input v-model.number="settingsForm.chat.temperature" type="number" min="0" max="2" step="0.1" required></label>
                   <label class="config-field"><span>最大输出 Tokens</span><input v-model.number="settingsForm.chat.max_tokens" type="number" min="128" max="32768" required></label>
+                  <label class="config-field"><span>问答证据片数</span><input v-model.number="settingsForm.chat.evidence_count" type="number" min="1" max="30" required></label>
                   <label class="config-field"><span>超时（秒）</span><input v-model.number="settingsForm.chat.timeout" type="number" min="10" max="600" required></label>
                 </div>
                 <div class="setting-card-footer"><button type="button" class="button setting-save-button" :disabled="savingSettings" @click="saveSettings('chat')">{{ savingSettingsSection === "chat" ? "保存中…" : "保存" }}</button></div>
@@ -879,7 +1277,7 @@ onBeforeUnmount(() => {
                 <div class="config-fields">
                   <label class="config-field"><span>单块字符数</span><input v-model.number="settingsForm.chunking.chunk_size" type="number" min="200" max="8000" required></label>
                   <label class="config-field"><span>重叠字符数</span><input v-model.number="settingsForm.chunking.chunk_overlap" type="number" min="0" max="2000" required></label>
-                  <label class="config-field"><span>默认 Top K</span><input v-model.number="settingsForm.chunking.default_top_k" type="number" min="1" max="30" required></label>
+                  <label class="config-field"><span>局部图谱补充 Top K</span><input v-model.number="settingsForm.chunking.default_top_k" type="number" min="1" max="30" required></label>
                 </div>
                 <div class="setting-card-footer"><button type="button" class="button setting-save-button" :disabled="savingSettings" @click="saveSettings('chunking')">{{ savingSettingsSection === "chunking" ? "保存中…" : "保存" }}</button></div>
               </article>
@@ -887,12 +1285,27 @@ onBeforeUnmount(() => {
               <article class="setting-card setting-card-form setting-card-compact" data-settings-section="graph" :class="{ editing: editingSettingsSection === 'graph' }" @pointerdown="beginSettingsEdit('graph')">
                 <div class="setting-card-head"><div><strong>GraphRAG</strong><small>实体关系抽取与社区构建</small></div><i class="config-status" /></div>
                 <div class="config-fields">
-                  <label class="config-field"><span>模型请求并发 <small>下次构建/继续时生效</small></span><input v-model.number="settingsForm.graph.concurrency" type="number" min="1" max="10" required><small>同时作用于实体关系抽取和社区摘要；建议 3–5，过高可能触发提供商限流</small></label>
+                  <label class="config-field"><span>模型请求并发 <small>下次构建/继续时生效</small></span><input v-model.number="settingsForm.graph.concurrency" type="number" min="1" max="1000" required><small>同时作用于实体关系抽取和社区摘要；建议 3–5，过高可能触发提供商限流</small></label>
                   <label class="config-field"><span>最大文本块</span><input v-model.number="settingsForm.graph.max_chunks" type="number" min="0" required><small>0 表示不限</small></label>
                   <label class="config-field"><span>单块超时（秒）</span><input v-model.number="settingsForm.graph.chunk_timeout" type="number" min="15" max="1800" required></label>
                   <label class="config-field"><span>总任务超时（秒）</span><input v-model.number="settingsForm.graph.build_timeout" type="number" min="60" max="86400" required></label>
+                  <label class="config-field"><span>自动重试轮数</span><input v-model.number="settingsForm.graph.retry_rounds" type="number" min="0" max="5" required><small>每轮自动减半并发；0 表示不做外层重试</small></label>
+                  <label class="config-field"><span>重试退避基数（秒）</span><input v-model.number="settingsForm.graph.retry_backoff" type="number" min="0.1" max="60" step="0.1" required><small>结合指数退避与随机抖动，避免请求风暴</small></label>
                 </div>
                 <div class="setting-card-footer"><button type="button" class="button setting-save-button" :disabled="savingSettings" @click="saveSettings('graph')">{{ savingSettingsSection === "graph" ? "保存中…" : "保存" }}</button></div>
+              </article>
+
+              <article class="setting-card setting-card-form setting-card-compact" data-settings-section="security" :class="{ editing: editingSettingsSection === 'security' }" @pointerdown="beginSettingsEdit('security')">
+                <div class="setting-card-head"><div><strong>Security</strong><small>当前知识库访问密码</small></div><i class="config-status" /></div>
+                <div class="config-fields">
+                  <label class="config-field"><span>旧密码</span><input v-model="securityForm.old_password" type="password" maxlength="200" autocomplete="current-password" placeholder="已有密码"></label>
+                  <label class="config-field"><span>新密码</span><input v-model="securityForm.new_password" type="password" maxlength="200" autocomplete="new-password" placeholder="新的访问密码"></label>
+                  <label class="config-field"><span>确认新密码</span><input v-model="securityForm.confirm_password" type="password" maxlength="200" autocomplete="new-password" placeholder="再次输入新密码"></label>
+                </div>
+                <div class="setting-card-footer">
+                  <span>仅修改当前知识库；保存后当前会话会自动重新解锁。</span>
+                  <button type="button" class="button setting-save-button" :disabled="savingPassword" @click="saveKnowledgeBasePassword">{{ savingPassword ? "保存中…" : "保存" }}</button>
+                </div>
               </article>
             </div>
           </form>
@@ -902,6 +1315,52 @@ onBeforeUnmount(() => {
     </main>
   </div>
 
-  <dialog ref="createModal" class="modal" @cancel.prevent="closeCreateModal" @click.self="closeCreateModal"><form novalidate @submit.prevent="createKnowledgeBase"><div class="modal-top"><span class="eyebrow">NEW KNOWLEDGE BASE</span><button type="button" aria-label="关闭" @click="closeCreateModal">×</button></div><h2>创建知识库</h2><label>名称<input v-model="creatingName" maxlength="80" placeholder="例如：产品技术文档"></label><label>描述（可选）<textarea v-model="creatingDescription" maxlength="500" rows="3" placeholder="这个知识库将用于什么？" /></label><div class="modal-actions"><button type="button" class="button button-ghost" @click="closeCreateModal">取消</button><button class="button button-primary" type="submit" :disabled="!creatingName.trim()">创建知识库</button></div></form></dialog>
+  <dialog ref="createModal" class="modal" @cancel.prevent="closeCreateModal" @click.self="closeCreateModal">
+    <form novalidate @submit.prevent="createKnowledgeBase">
+      <div class="modal-top"><span class="eyebrow">NEW KNOWLEDGE BASE</span><button type="button" aria-label="关闭" @click="closeCreateModal">×</button></div>
+      <h2>创建知识库</h2>
+      <label>名称<input v-model="creatingName" maxlength="80" placeholder="例如：产品技术文档"></label>
+      <label>描述（可选）<textarea v-model="creatingDescription" maxlength="500" rows="3" placeholder="这个知识库将用于什么？" /></label>
+      <label>访问密码<input v-model="creatingPassword" type="password" maxlength="200" autocomplete="new-password" placeholder="进入知识库时需要输入"></label>
+      <label>确认密码<input v-model="creatingPasswordConfirm" type="password" maxlength="200" autocomplete="new-password" placeholder="再次输入访问密码"></label>
+      <div class="modal-actions">
+        <button type="button" class="button button-ghost" @click="closeCreateModal">取消</button>
+        <button class="button button-primary" type="submit" :disabled="!creatingName.trim() || !creatingPassword.trim() || creatingPassword !== creatingPasswordConfirm">创建知识库</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog ref="unlockModal" class="modal" @cancel.prevent="closeUnlockModal" @click.self="closeUnlockModal">
+    <form novalidate @submit.prevent="unlockKnowledgeBase">
+      <div class="modal-top"><span class="eyebrow">SECURE KNOWLEDGE BASE</span><button type="button" aria-label="关闭" @click="closeUnlockModal">×</button></div>
+      <h2>输入访问密码</h2>
+      <p class="modal-copy">{{ unlockTarget?.name }}</p>
+      <label>密码<input v-model="unlockPassword" type="password" maxlength="200" autocomplete="current-password" autofocus></label>
+      <div class="modal-actions">
+        <button type="button" class="button button-ghost" @click="closeUnlockModal">取消</button>
+        <button class="button button-primary" type="submit" :disabled="!unlockPassword || unlocking">{{ unlocking ? "解锁中…" : "进入知识库" }}</button>
+      </div>
+    </form>
+  </dialog>
+  <dialog ref="duplicateModal" class="modal modal-wide" @cancel.prevent="closeDuplicateModal">
+    <form novalidate @submit.prevent="confirmDuplicateResolution">
+      <div class="modal-top"><span class="eyebrow">DUPLICATE FILES</span><button type="button" aria-label="关闭" @click="closeDuplicateModal">×</button></div>
+      <h2>您可能上传了重复的文件</h2>
+      <p class="modal-copy">涉及文件如下，请选择需要保留的文件。默认不保留；未勾选的已有文件会被删除，未勾选的待上传文件会被跳过。</p>
+      <div class="duplicate-list">
+        <section v-for="group in duplicateGroups" :key="group.sha256" class="duplicate-group">
+          <div class="duplicate-hash">SHA256 {{ group.sha256 }}</div>
+          <label v-for="item in group.items" :key="item.key" class="duplicate-item">
+            <span><strong>{{ item.filename }}</strong><small>{{ item.kind === "existing" ? "已有文件" : "待上传" }} · {{ formatBytes(item.size_bytes) }}</small></span>
+            <input v-model="duplicateSelections[item.key]" type="checkbox">
+          </label>
+        </section>
+      </div>
+      <div class="modal-actions duplicate-actions">
+        <button type="button" class="button button-ghost" @click="setAllDuplicateSelections(true)">全部保留</button>
+        <button type="button" class="button button-ghost" @click="setAllDuplicateSelections(false)">全部丢弃</button>
+        <button class="button button-primary" type="submit">确认</button>
+      </div>
+    </form>
+  </dialog>
   <div ref="toastContainer" popover="manual" class="toast-container" aria-live="polite"><div v-for="toast in toasts" :key="toast.id" class="toast" :class="toast.type">{{ toast.message }}</div></div>
 </template>

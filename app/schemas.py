@@ -9,6 +9,16 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, field_validator, m
 class KnowledgeBaseCreate(BaseModel):
     name: str = Field(min_length=1, max_length=80)
     description: str = Field(default="", max_length=500)
+    password: str = Field(min_length=1, max_length=200)
+
+
+class KnowledgeBaseUnlock(BaseModel):
+    password: str = Field(min_length=1, max_length=200)
+
+
+class KnowledgeBasePasswordUpdate(BaseModel):
+    old_password: str = Field(default="", max_length=200)
+    new_password: str = Field(min_length=1, max_length=200)
 
 
 class ProviderSettingsUpdate(BaseModel):
@@ -54,6 +64,7 @@ class ChatSettingsUpdate(ProviderSettingsUpdate):
     timeout: float = Field(ge=10.0, le=600.0)
     temperature: float = Field(ge=0.0, le=2.0)
     max_tokens: int = Field(ge=128, le=32768)
+    evidence_count: int = Field(ge=1, le=30)
 
 
 class OCRSettingsUpdate(ProviderSettingsUpdate):
@@ -90,10 +101,12 @@ class ChunkingSettingsUpdate(BaseModel):
 class GraphSettingsUpdate(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    concurrency: int = Field(ge=1, le=10)
+    concurrency: int = Field(ge=1, le=1000)
     max_chunks: int = Field(ge=0)
     chunk_timeout: float = Field(ge=15, le=1800)
     build_timeout: float = Field(ge=60, le=86400)
+    retry_rounds: int = Field(ge=0, le=5)
+    retry_backoff: float = Field(ge=0.1, le=60)
 
 
 class SettingsUpdate(BaseModel):

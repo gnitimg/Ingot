@@ -23,10 +23,23 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
         assert health["embedding_configured"] is False
 
         created = client.post(
-            "/api/knowledge-bases", json={"name": "API 测试库", "description": "test"}
+            "/api/knowledge-bases",
+            json={"name": "API 测试库", "description": "test", "password": "secret"},
         )
         assert created.status_code == 201
-        kb_id = created.json()["id"]
+        created_payload = created.json()
+        kb_id = created_payload["id"]
+        auth_headers = {"X-Ingot-KB-Token": created_payload["access_token"]}
+        assert "password_hash" not in created.text
+        assert client.get(f"/api/knowledge-bases/{kb_id}").status_code == 401
+        assert client.post(
+            f"/api/knowledge-bases/{kb_id}/unlock", json={"password": "wrong"}
+        ).status_code == 401
+        unlocked = client.post(
+            f"/api/knowledge-bases/{kb_id}/unlock", json={"password": "secret"}
+        )
+        assert unlocked.status_code == 200
+        auth_headers = {"X-Ingot-KB-Token": unlocked.json()["access_token"]}
 
         listed = client.get("/api/knowledge-bases").json()
         assert listed[0]["name"] == "API 测试库"
@@ -48,21 +61,27 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
             await asyncio.sleep(60)
 
         monkeypatch.setattr(main.graph_rag, "rebuild", slow_graph_build)
-        started = client.post(f"/api/knowledge-bases/{kb_id}/graph/rebuild")
+        started = client.post(f"/api/knowledge-bases/{kb_id}/graph/rebuild", headers=auth_headers)
         assert started.status_code == 202
         assert started.json()["total"] == 1
-        building = client.get(f"/api/knowledge-bases/{kb_id}").json()
+        building = client.get(f"/api/knowledge-bases/{kb_id}", headers=auth_headers).json()
         assert building["graph_status"] == "building"
         assert building["graph_progress_total"] == 1
-        assert client.post(f"/api/knowledge-bases/{kb_id}/graph/cancel").status_code == 202
-        stopped = client.get(f"/api/knowledge-bases/{kb_id}").json()
+        assert client.post(
+            f"/api/knowledge-bases/{kb_id}/graph/cancel", headers=auth_headers
+        ).status_code == 202
+        stopped = client.get(f"/api/knowledge-bases/{kb_id}", headers=auth_headers).json()
         assert stopped["graph_status"] == "stale"
         assert stopped["graph_stage"] == "stopped"
         assert stopped["graph_progress_total"] == 0
 
-        main.db.prepare_graph_checkpoints(kb_id, ["graph-chunk"])
-        main.db.start_graph_build(kb_id, 1)
-        main.db.pause_graph_build(kb_id, "测试暂停")
+        main.db.execute(
+            """UPDATE knowledge_bases
+               SET graph_status = 'error', graph_error = ?, graph_stage = 'failed',
+                   graph_progress_current = 0, graph_progress_total = 1
+               WHERE id = ?""",
+            ("图谱构建超过 60 分钟上限，已自动停止；可调整超时后重试", kb_id),
+        )
 
         async def finish_resumed_graph(target_id, *, resume=False):
             assert target_id == kb_id
@@ -71,16 +90,43 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
             main.db.clear_graph_checkpoints(target_id)
 
         monkeypatch.setattr(main.graph_rag, "rebuild", finish_resumed_graph)
-        resumed = client.post(f"/api/knowledge-bases/{kb_id}/graph/resume")
+        # A cached legacy frontend still posts to /rebuild. Once checkpoints
+        # exist, the compatibility endpoint must resume instead of clearing them.
+        resumed = client.post(f"/api/knowledge-bases/{kb_id}/graph/rebuild", headers=auth_headers)
         assert resumed.status_code == 202
+        assert resumed.json()["resumed"] is True
+        assert resumed.json()["total"] == 1
         for _ in range(50):
-            resumed_state = client.get(f"/api/knowledge-bases/{kb_id}").json()
+            resumed_state = client.get(f"/api/knowledge-bases/{kb_id}", headers=auth_headers).json()
             if resumed_state["graph_status"] == "ready":
                 break
             time.sleep(0.01)
         assert resumed_state["graph_status"] == "ready"
 
-        assert client.delete(f"/api/knowledge-bases/{kb_id}").status_code == 204
+        # The explicit resume endpoint follows the same persisted checkpoint.
+        main.db.prepare_graph_checkpoints(kb_id, ["graph-chunk"])
+        main.db.pause_graph_build(kb_id, "test pause")
+        resumed_explicitly = client.post(
+            f"/api/knowledge-bases/{kb_id}/graph/resume", headers=auth_headers
+        )
+        assert resumed_explicitly.status_code == 202
+        assert resumed_explicitly.json()["resumed"] is True
+        for _ in range(50):
+            resumed_state = client.get(f"/api/knowledge-bases/{kb_id}", headers=auth_headers).json()
+            if resumed_state["graph_status"] == "ready":
+                break
+            time.sleep(0.01)
+        assert resumed_state["graph_status"] == "ready"
+
+        changed_password = client.put(
+            f"/api/knowledge-bases/{kb_id}/password",
+            headers=auth_headers,
+            json={"old_password": "secret", "new_password": "new-secret"},
+        )
+        assert changed_password.status_code == 200
+        auth_headers = {"X-Ingot-KB-Token": changed_password.json()["access_token"]}
+
+        assert client.delete(f"/api/knowledge-bases/{kb_id}", headers=auth_headers).status_code == 204
         assert client.get("/api/knowledge-bases").json() == []
 
         current = client.get("/api/settings").json()
@@ -100,6 +146,7 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
                 "timeout": current["chat_timeout"],
                 "temperature": current["chat_temperature"],
                 "max_tokens": current["chat_max_tokens"],
+                "evidence_count": current["qa_evidence_count"],
             },
             "ocr": {
                 "enabled": current["ocr_enabled"],
@@ -128,25 +175,34 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
                 "default_top_k": current["default_top_k"],
             },
             "graph": {
-                "concurrency": 5,
+                "concurrency": 1000,
                 "max_chunks": current["graph_max_chunks"],
                 "chunk_timeout": current["graph_chunk_timeout"],
                 "build_timeout": current["graph_build_timeout"],
+                "retry_rounds": current["graph_retry_rounds"],
+                "retry_backoff": current["graph_retry_backoff"],
             },
         }
         updated = client.put("/api/settings", json=payload)
         assert updated.status_code == 200
         assert updated.json()["embedding_model"] == "BAAI/bge-m3-test"
-        assert updated.json()["graph_concurrency"] == 5
+        assert updated.json()["graph_concurrency"] == 1000
+        assert updated.json()["qa_evidence_count"] == current["qa_evidence_count"]
         assert "test-secret-key" not in updated.text
         assert "EMBEDDING_API_KEY=test-secret-key" in (tmp_path / ".env").read_text(encoding="utf-8")
-        assert "GRAPH_CONCURRENCY=5" in (tmp_path / ".env").read_text(encoding="utf-8")
+        assert "GRAPH_CONCURRENCY=1000" in (tmp_path / ".env").read_text(encoding="utf-8")
+        assert "QA_EVIDENCE_COUNT=" in (tmp_path / ".env").read_text(encoding="utf-8")
 
         payload["embedding"]["api_key"] = ""
         retained = client.put("/api/settings", json=payload)
         assert retained.status_code == 200
         assert "EMBEDDING_API_KEY=test-secret-key" in (tmp_path / ".env").read_text(encoding="utf-8")
 
+        payload["graph"]["concurrency"] = 1001
+        rejected_concurrency = client.put("/api/settings", json=payload)
+        assert rejected_concurrency.status_code == 422
+
+        payload["graph"]["concurrency"] = 1000
         payload["embedding"]["api_key"] = "${SHOULD_NOT_LEAK}"
         rejected = client.put("/api/settings", json=payload)
         assert rejected.status_code == 422

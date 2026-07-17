@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import json
+import secrets
 from contextlib import asynccontextmanager
 from ipaddress import ip_address
 from pathlib import Path
@@ -13,7 +16,14 @@ from pydantic import SecretStr
 
 from app.config import Settings, get_settings
 from app.database import Database
-from app.schemas import ChatRequest, KnowledgeBaseCreate, SearchRequest, SettingsUpdate
+from app.schemas import (
+    ChatRequest,
+    KnowledgeBaseCreate,
+    KnowledgeBasePasswordUpdate,
+    KnowledgeBaseUnlock,
+    SearchRequest,
+    SettingsUpdate,
+)
 from app.services.ai_client import AIClient, AIServiceError
 from app.services.graph_rag import GraphRAGService
 from app.services.ingestion import IngestionService
@@ -30,6 +40,7 @@ retrieval = RetrievalService(db, ai, settings)
 static_dir = Path(__file__).parent / "static"
 settings_update_lock = asyncio.Lock()
 graph_tasks: dict[str, asyncio.Task[None]] = {}
+kb_access_tokens: dict[str, set[str]] = {}
 
 RUNTIME_ENV_KEYS = {
     "embedding_base_url": "EMBEDDING_BASE_URL",
@@ -61,10 +72,13 @@ RUNTIME_ENV_KEYS = {
     "chunk_size": "CHUNK_SIZE",
     "chunk_overlap": "CHUNK_OVERLAP",
     "default_top_k": "DEFAULT_TOP_K",
+    "qa_evidence_count": "QA_EVIDENCE_COUNT",
     "graph_concurrency": "GRAPH_CONCURRENCY",
     "graph_max_chunks": "GRAPH_MAX_CHUNKS",
     "graph_chunk_timeout": "GRAPH_CHUNK_TIMEOUT",
     "graph_build_timeout": "GRAPH_BUILD_TIMEOUT",
+    "graph_retry_rounds": "GRAPH_RETRY_ROUNDS",
+    "graph_retry_backoff": "GRAPH_RETRY_BACKOFF",
 }
 
 
@@ -99,6 +113,7 @@ def _candidate_settings(payload: SettingsUpdate) -> Settings:
         chat_timeout=payload.chat.timeout,
         chat_temperature=payload.chat.temperature,
         chat_max_tokens=payload.chat.max_tokens,
+        qa_evidence_count=payload.chat.evidence_count,
         ocr_enabled=payload.ocr.enabled,
         ocr_base_url="" if payload.ocr.use_embedding_provider else payload.ocr.base_url,
         ocr_api_key=(
@@ -129,6 +144,8 @@ def _candidate_settings(payload: SettingsUpdate) -> Settings:
         graph_max_chunks=payload.graph.max_chunks,
         graph_chunk_timeout=payload.graph.chunk_timeout,
         graph_build_timeout=payload.graph.build_timeout,
+        graph_retry_rounds=payload.graph.retry_rounds,
+        graph_retry_backoff=payload.graph.retry_backoff,
     )
     return Settings(_env_file=None, **values)
 
@@ -149,6 +166,7 @@ async def lifespan(_: FastAPI):
                 knowledge_base = db.get_knowledge_base(kb_id)
                 if knowledge_base and knowledge_base["graph_status"] == "building":
                     db.pause_graph_build(kb_id, "服务停止导致图谱构建暂停，可从当前检查点继续")
+        await ai.aclose()
 
 
 app = FastAPI(
@@ -164,6 +182,34 @@ def require_knowledge_base(kb_id: str) -> dict:
     knowledge_base = db.get_knowledge_base(kb_id)
     if not knowledge_base:
         raise HTTPException(status_code=404, detail="知识库不存在")
+    return knowledge_base
+
+
+def _token_digest(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def issue_kb_access_token(kb_id: str) -> str:
+    token = secrets.token_urlsafe(32)
+    kb_access_tokens.setdefault(kb_id, set()).add(_token_digest(token))
+    return token
+
+
+def revoke_kb_access_tokens(kb_id: str) -> None:
+    kb_access_tokens.pop(kb_id, None)
+
+
+def require_knowledge_base_access(kb_id: str, request: Request) -> dict:
+    knowledge_base = require_knowledge_base(kb_id)
+    if not knowledge_base.get("has_password"):
+        return knowledge_base
+    token = request.headers.get("X-Ingot-KB-Token", "")
+    token_digest = _token_digest(token) if token else ""
+    if not any(
+        hmac.compare_digest(token_digest, stored)
+        for stored in kb_access_tokens.get(kb_id, set())
+    ):
+        raise HTTPException(status_code=401, detail="请先输入密码解锁知识库")
     return knowledge_base
 
 
@@ -196,6 +242,32 @@ async def cancel_active_graph_task(kb_id: str) -> None:
     if task and not task.done():
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+def launch_graph_task(kb_id: str, *, resume: bool) -> None:
+    task = asyncio.create_task(
+        run_graph_build(kb_id, resume=resume),
+        name=f"graph-{'resume' if resume else 'build'}-{kb_id}",
+    )
+    graph_tasks[kb_id] = task
+    task.add_done_callback(lambda completed: forget_graph_task(kb_id, completed))
+
+
+def resume_graph_from_checkpoint(kb_id: str, knowledge_base: dict) -> dict:
+    checkpoint = db.graph_checkpoint_stats(kb_id)
+    if not checkpoint["total"]:
+        raise HTTPException(status_code=409, detail="构建检查点不存在，请从零重新构建")
+    db.resume_graph_build(kb_id)
+    checkpoint = db.graph_checkpoint_stats(kb_id)
+    launch_graph_task(kb_id, resume=True)
+    return {
+        "status": "building",
+        "resumed": True,
+        "stage": knowledge_base["graph_stage"],
+        "current": checkpoint["succeeded"],
+        "total": checkpoint["total"],
+        "failed": checkpoint["failed"],
+    }
 
 
 def require_local_request(request: Request) -> None:
@@ -250,6 +322,7 @@ async def public_settings() -> dict:
         "chat_timeout": settings.chat_timeout,
         "chat_temperature": settings.chat_temperature,
         "chat_max_tokens": settings.chat_max_tokens,
+        "qa_evidence_count": settings.qa_evidence_count,
         "ocr_enabled": settings.ocr_enabled,
         "ocr_base_url": settings.effective_ocr_base_url,
         "ocr_model": settings.ocr_model,
@@ -279,6 +352,8 @@ async def public_settings() -> dict:
         "graph_max_chunks": settings.graph_max_chunks,
         "graph_chunk_timeout": settings.graph_chunk_timeout,
         "graph_build_timeout": settings.graph_build_timeout,
+        "graph_retry_rounds": settings.graph_retry_rounds,
+        "graph_retry_backoff": settings.graph_retry_backoff,
     }
 
 
@@ -311,33 +386,71 @@ async def list_knowledge_bases() -> list[dict]:
 
 @app.post("/api/knowledge-bases", status_code=status.HTTP_201_CREATED)
 async def create_knowledge_base(payload: KnowledgeBaseCreate) -> dict:
-    return db.create_knowledge_base(payload.name.strip(), payload.description.strip())
+    password = payload.password.strip()
+    if not password:
+        raise HTTPException(status_code=422, detail="知识库密码不能为空")
+    knowledge_base = db.create_knowledge_base(
+        payload.name.strip(), payload.description.strip(), password
+    )
+    return {**knowledge_base, "access_token": issue_kb_access_token(knowledge_base["id"])}
+
+
+@app.post("/api/knowledge-bases/{kb_id}/unlock")
+async def unlock_knowledge_base(kb_id: str, payload: KnowledgeBaseUnlock) -> dict:
+    knowledge_base = require_knowledge_base(kb_id)
+    if not db.verify_knowledge_base_password(kb_id, payload.password):
+        raise HTTPException(status_code=401, detail="知识库密码不正确")
+    return {
+        "access_token": issue_kb_access_token(kb_id),
+        "knowledge_base": knowledge_base,
+    }
+
+
+@app.put("/api/knowledge-bases/{kb_id}/password")
+async def update_knowledge_base_password(
+    kb_id: str, payload: KnowledgeBasePasswordUpdate, request: Request
+) -> dict:
+    require_knowledge_base_access(kb_id, request)
+    new_password = payload.new_password.strip()
+    if not new_password:
+        raise HTTPException(status_code=422, detail="新密码不能为空")
+    if not db.change_knowledge_base_password(kb_id, payload.old_password, new_password):
+        raise HTTPException(status_code=403, detail="旧密码不正确")
+    revoke_kb_access_tokens(kb_id)
+    knowledge_base = require_knowledge_base(kb_id)
+    return {
+        "access_token": issue_kb_access_token(kb_id),
+        "knowledge_base": knowledge_base,
+    }
 
 
 @app.get("/api/knowledge-bases/{kb_id}")
-async def get_knowledge_base(kb_id: str) -> dict:
-    return require_knowledge_base(kb_id)
+async def get_knowledge_base(kb_id: str, request: Request) -> dict:
+    return require_knowledge_base_access(kb_id, request)
 
 
 @app.delete("/api/knowledge-bases/{kb_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_knowledge_base(kb_id: str) -> None:
-    require_knowledge_base(kb_id)
+async def delete_knowledge_base(kb_id: str, request: Request) -> None:
+    require_knowledge_base_access(kb_id, request)
     await cancel_active_graph_task(kb_id)
     paths = db.delete_knowledge_base(kb_id)
+    revoke_kb_access_tokens(kb_id)
     for path in paths:
         ingestion.remove_file(path)
     ingestion.remove_tree(settings.upload_dir / kb_id)
 
 
 @app.get("/api/knowledge-bases/{kb_id}/documents")
-async def list_documents(kb_id: str) -> list[dict]:
-    require_knowledge_base(kb_id)
+async def list_documents(kb_id: str, request: Request) -> list[dict]:
+    require_knowledge_base_access(kb_id, request)
     return db.list_documents(kb_id)
 
 
 @app.post("/api/knowledge-bases/{kb_id}/documents")
-async def upload_documents(kb_id: str, files: list[UploadFile] = File(...)) -> dict:
-    knowledge_base = require_knowledge_base(kb_id)
+async def upload_documents(
+    kb_id: str, request: Request, files: list[UploadFile] = File(...)
+) -> dict:
+    knowledge_base = require_knowledge_base_access(kb_id, request)
     if not files:
         raise HTTPException(status_code=400, detail="请选择至少一个文件")
     if knowledge_base["graph_status"] in {"building", "paused"}:
@@ -359,8 +472,8 @@ async def upload_documents(kb_id: str, files: list[UploadFile] = File(...)) -> d
 
 
 @app.delete("/api/knowledge-bases/{kb_id}/documents/{document_id}", status_code=status.HTTP_204_NO_CONTENT)
-async def delete_document(kb_id: str, document_id: str) -> None:
-    require_knowledge_base(kb_id)
+async def delete_document(kb_id: str, document_id: str, request: Request) -> None:
+    require_knowledge_base_access(kb_id, request)
     await cancel_active_graph_task(kb_id)
     path = db.delete_document(kb_id, document_id)
     if path is None:
@@ -369,8 +482,8 @@ async def delete_document(kb_id: str, document_id: str) -> None:
 
 
 @app.post("/api/knowledge-bases/{kb_id}/search")
-async def search(kb_id: str, payload: SearchRequest) -> dict:
-    knowledge_base = require_knowledge_base(kb_id)
+async def search(kb_id: str, payload: SearchRequest, request: Request) -> dict:
+    knowledge_base = require_knowledge_base_access(kb_id, request)
     if not knowledge_base["chunk_count"]:
         raise HTTPException(status_code=400, detail="知识库中还没有可检索的文档")
     if payload.mode.startswith("graph") and knowledge_base["graph_status"] != "ready":
@@ -382,8 +495,8 @@ async def search(kb_id: str, payload: SearchRequest) -> dict:
 
 
 @app.post("/api/knowledge-bases/{kb_id}/chat")
-async def chat(kb_id: str, payload: ChatRequest) -> StreamingResponse:
-    knowledge_base = require_knowledge_base(kb_id)
+async def chat(kb_id: str, payload: ChatRequest, request: Request) -> StreamingResponse:
+    knowledge_base = require_knowledge_base_access(kb_id, request)
     if not knowledge_base["chunk_count"]:
         raise HTTPException(status_code=400, detail="请先上传并解析文档")
     if payload.mode in {"graph_local", "graph_global"} and knowledge_base["graph_status"] != "ready":
@@ -426,26 +539,41 @@ async def chat(kb_id: str, payload: ChatRequest) -> StreamingResponse:
 
 
 @app.post("/api/knowledge-bases/{kb_id}/graph/rebuild", status_code=status.HTTP_202_ACCEPTED)
-async def rebuild_graph(kb_id: str) -> dict:
-    knowledge_base = require_knowledge_base(kb_id)
+async def rebuild_graph(kb_id: str, request: Request) -> dict:
+    knowledge_base = require_knowledge_base_access(kb_id, request)
     active_task = graph_tasks.get(kb_id)
     if active_task and not active_task.done():
         raise HTTPException(status_code=409, detail="图谱正在构建")
     if not knowledge_base["chunk_count"]:
         raise HTTPException(status_code=400, detail="请先上传并解析文档")
+    if knowledge_base["graph_status"] == "building":
+        db.pause_graph_build(kb_id, "构建任务已丢失，已恢复为暂停状态")
+        knowledge_base = require_knowledge_base(kb_id)
+    if knowledge_base["graph_status"] in {"error", "paused"}:
+        db.recover_legacy_graph_timeout(kb_id)
+        knowledge_base = require_knowledge_base(kb_id)
+    # Compatibility guard: old browser bundles only know /rebuild. A persisted
+    # checkpoint is authoritative regardless of the legacy status value; never
+    # let an old button accidentally clear partial graph data.
+    checkpoint = db.graph_checkpoint_stats(kb_id)
+    if checkpoint["total"]:
+        if knowledge_base["graph_status"] != "paused":
+            db.pause_graph_build(kb_id, "检测到未完成的构建检查点，可从当前进度继续")
+            knowledge_base = require_knowledge_base(kb_id)
+        return resume_graph_from_checkpoint(kb_id, knowledge_base)
     total = int(knowledge_base["chunk_count"])
     if settings.graph_max_chunks:
         total = min(total, settings.graph_max_chunks)
     db.start_graph_build(kb_id, total)
-    task = asyncio.create_task(run_graph_build(kb_id), name=f"graph-build-{kb_id}")
-    graph_tasks[kb_id] = task
-    task.add_done_callback(lambda completed: forget_graph_task(kb_id, completed))
-    return {"status": "building", "stage": "queued", "current": 0, "total": total}
+    launch_graph_task(kb_id, resume=False)
+    return {"status": "building", "resumed": False, "stage": "queued", "current": 0, "total": total}
 
 
 @app.post("/api/knowledge-bases/{kb_id}/graph/cancel", status_code=status.HTTP_202_ACCEPTED)
-async def cancel_graph(kb_id: str) -> dict:
-    knowledge_base = require_knowledge_base(kb_id)
+async def cancel_graph(kb_id: str, request: Request) -> dict:
+    knowledge_base = require_knowledge_base_access(kb_id, request)
+    if knowledge_base["graph_status"] in {"error", "paused"} and db.recover_legacy_graph_timeout(kb_id):
+        knowledge_base = require_knowledge_base(kb_id)
     if knowledge_base["graph_status"] not in {"building", "paused"}:
         raise HTTPException(status_code=409, detail="当前没有可停止的图谱任务")
     await cancel_active_graph_task(kb_id)
@@ -458,35 +586,25 @@ async def cancel_graph(kb_id: str) -> dict:
 
 
 @app.post("/api/knowledge-bases/{kb_id}/graph/resume", status_code=status.HTTP_202_ACCEPTED)
-async def resume_graph(kb_id: str) -> dict:
-    knowledge_base = require_knowledge_base(kb_id)
+async def resume_graph(kb_id: str, request: Request) -> dict:
+    knowledge_base = require_knowledge_base_access(kb_id, request)
     active_task = graph_tasks.get(kb_id)
     if active_task and not active_task.done():
         raise HTTPException(status_code=409, detail="图谱正在构建")
+    if knowledge_base["graph_status"] in {"error", "paused"} and db.recover_legacy_graph_timeout(kb_id):
+        knowledge_base = require_knowledge_base(kb_id)
+    checkpoint = db.graph_checkpoint_stats(kb_id)
+    if checkpoint["total"] and knowledge_base["graph_status"] != "paused":
+        db.pause_graph_build(kb_id, "检测到未完成的构建检查点，可从当前进度继续")
+        knowledge_base = require_knowledge_base(kb_id)
     if knowledge_base["graph_status"] != "paused":
         raise HTTPException(status_code=409, detail="当前图谱任务不处于暂停状态")
-    checkpoint = db.graph_checkpoint_stats(kb_id)
-    if not checkpoint["total"]:
-        raise HTTPException(status_code=409, detail="构建检查点不存在，请从零重新构建")
-    db.resume_graph_build(kb_id)
-    task = asyncio.create_task(
-        run_graph_build(kb_id, resume=True),
-        name=f"graph-resume-{kb_id}",
-    )
-    graph_tasks[kb_id] = task
-    task.add_done_callback(lambda completed: forget_graph_task(kb_id, completed))
-    return {
-        "status": "building",
-        "stage": knowledge_base["graph_stage"],
-        "current": checkpoint["processed"],
-        "total": checkpoint["total"],
-        "failed": checkpoint["failed"],
-    }
+    return resume_graph_from_checkpoint(kb_id, knowledge_base)
 
 
 @app.get("/api/knowledge-bases/{kb_id}/graph")
-async def get_graph(kb_id: str, limit: int = 500) -> dict:
-    knowledge_base = require_knowledge_base(kb_id)
+async def get_graph(kb_id: str, request: Request, limit: int = 500) -> dict:
+    knowledge_base = require_knowledge_base_access(kb_id, request)
     data = db.graph_data(kb_id, min(max(limit, 20), 1000))
     communities = db.fetch_all(
         """SELECT id, title, summary, member_count FROM communities
