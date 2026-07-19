@@ -47,7 +47,20 @@ class GraphRAGService:
         self.ai = ai
         self.settings = settings
 
-    async def _extract_chunk(self, chunk: dict[str, Any], semaphore: asyncio.Semaphore) -> dict[str, Any]:
+    def _graph_request_timeout(self) -> float:
+        # Keep both HTTP attempts inside the chunk-level deadline. Graph
+        # extraction is deterministic JSON work and should not occupy a worker
+        # for the much longer interactive-chat timeout.
+        return max(
+            15.0,
+            min(
+                self.settings.chat_timeout,
+                90.0,
+                self.settings.graph_chunk_timeout * 0.4,
+            ),
+        )
+
+    async def _extract_chunk(self, chunk: dict[str, Any]) -> dict[str, Any]:
         extraction_limits = (
             "\n\n抽取约束：最多返回 12 个实体、18 条关系；"
             "优先保留对问答有价值的核心概念、表名、字段名、角色、流程、指标和系统模块；"
@@ -59,32 +72,35 @@ class GraphRAGService:
             f"{chunk['content'][:6000]}"
             f"{extraction_limits}"
         )
-        async with semaphore:
-            try:
-                response = await self.ai.chat_complete(
-                    [
-                        {"role": "system", "content": GRAPH_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0,
-                    max_tokens=1600,
-                    json_mode=True,
-                )
-            except AIServiceError as exc:
-                # Plain JSON fallback is only for providers that explicitly do
-                # not support response_format. Falling back after 429/timeouts
-                # would immediately double the request storm.
-                if not exc.json_mode_unsupported:
-                    raise
-                response = await self.ai.chat_complete(
-                    [
-                        {"role": "system", "content": GRAPH_SYSTEM_PROMPT},
-                        {"role": "user", "content": prompt},
-                    ],
-                    temperature=0,
-                    max_tokens=1600,
-                    json_mode=False,
-                )
+        messages = [
+            {"role": "system", "content": GRAPH_SYSTEM_PROMPT},
+            {"role": "user", "content": prompt},
+        ]
+        try:
+            response = await self.ai.chat_complete(
+                messages,
+                temperature=0,
+                max_tokens=1600,
+                json_mode=True,
+                enable_thinking=False,
+                request_timeout=self._graph_request_timeout(),
+                max_attempts=2,
+            )
+        except AIServiceError as exc:
+            # Plain JSON fallback is only for providers that explicitly do
+            # not support response_format. Falling back after 429/timeouts
+            # would immediately double the request storm.
+            if not exc.json_mode_unsupported:
+                raise
+            response = await self.ai.chat_complete(
+                messages,
+                temperature=0,
+                max_tokens=1600,
+                json_mode=False,
+                enable_thinking=False,
+                request_timeout=self._graph_request_timeout(),
+                max_attempts=1,
+            )
         result = parse_json_object(response)
         result["chunk_id"] = chunk["id"]
         return result
@@ -265,8 +281,17 @@ class GraphRAGService:
 关系：
 %s""" % ("\n".join(entity_lines), "\n".join(relation_lines))
         try:
-            response = await self.ai.chat_complete(
-                [{"role": "user", "content": prompt}], temperature=0, max_tokens=700, json_mode=True
+            response = await asyncio.wait_for(
+                self.ai.chat_complete(
+                    [{"role": "user", "content": prompt}],
+                    temperature=0,
+                    max_tokens=700,
+                    json_mode=True,
+                    enable_thinking=False,
+                    request_timeout=self._graph_request_timeout(),
+                    max_attempts=2,
+                ),
+                timeout=self.settings.graph_chunk_timeout,
             )
             parsed = parse_json_object(response)
             title = str(parsed.get("title") or fallback_title)[:80]
@@ -318,26 +343,39 @@ class GraphRAGService:
             jobs.append((member_ids, members, internal_relations))
 
         summaries: list[tuple[list[str], str, str]] = []
-        batch_size = max(1, self.settings.graph_concurrency)
-        for start in range(0, len(jobs), batch_size):
-            batch = jobs[start : start + batch_size]
-            results = await asyncio.gather(
-                *(
-                    self._summarize_community(members, internal_relations)
-                    for _, members, internal_relations in batch
+        semaphore = asyncio.Semaphore(max(1, self.settings.graph_concurrency))
+
+        async def summarize_job(
+            member_ids: list[str],
+            members: list[dict[str, Any]],
+            internal_relations: list[dict[str, Any]],
+        ) -> tuple[list[str], str, str]:
+            async with semaphore:
+                title, summary = await self._summarize_community(members, internal_relations)
+            return member_ids, title, summary
+
+        summary_tasks = [
+            asyncio.create_task(summarize_job(member_ids, members, internal_relations))
+            for member_ids, members, internal_relations in jobs
+        ]
+        completed_summaries = 0
+        try:
+            for completed_task in asyncio.as_completed(summary_tasks):
+                summaries.append(await completed_task)
+                completed_summaries += 1
+                self.db.update_graph_progress(
+                    kb_id,
+                    stage="communities",
+                    current=completed_summaries,
+                    total=len(communities),
+                    failed_chunks=failed_chunks,
                 )
-            )
-            summaries.extend(
-                (member_ids, title, summary)
-                for (member_ids, _, _), (title, summary) in zip(batch, results, strict=True)
-            )
-            self.db.update_graph_progress(
-                kb_id,
-                stage="communities",
-                current=min(start + len(batch), len(jobs)),
-                total=len(communities),
-                failed_chunks=failed_chunks,
-            )
+        finally:
+            for task in summary_tasks:
+                if not task.done():
+                    task.cancel()
+            if summary_tasks:
+                await asyncio.gather(*summary_tasks, return_exceptions=True)
 
         self.db.update_graph_progress(
             kb_id,
@@ -396,78 +434,127 @@ class GraphRAGService:
             stage="extracting",
             current=stats["succeeded"],
             total=stats["total"],
-            failed_chunks=max(0, stats["total"] - stats["succeeded"] - len(remaining)),
+            failed_chunks=max(0, stats["total"] - stats["succeeded"]),
         )
         for round_index in range(self.settings.graph_retry_rounds + 1):
             if not remaining:
                 break
             divisor = 2**round_index
             concurrency = max(1, (configured_concurrency + divisor - 1) // divisor)
-            semaphore = asyncio.Semaphore(concurrency)
+            target_concurrency = concurrency
+            success_streak = 0
             retry_queue: list[dict[str, Any]] = []
             stage = "extracting" if round_index == 0 else "retrying"
-            start = 0
-            while start < len(remaining):
-                batch = remaining[start : start + concurrency]
-                results = await asyncio.gather(
-                    *(
+            next_index = 0
+            in_flight: dict[asyncio.Task[dict[str, Any]], dict[str, Any]] = {}
+
+            def fill_worker_slots() -> None:
+                nonlocal next_index
+                while (
+                    next_index < len(remaining)
+                    and len(in_flight) < target_concurrency
+                ):
+                    chunk = remaining[next_index]
+                    next_index += 1
+                    task = asyncio.create_task(
                         asyncio.wait_for(
-                            self._extract_chunk(chunk, semaphore),
+                            self._extract_chunk(chunk),
                             timeout=self.settings.graph_chunk_timeout,
                         )
-                        for chunk in batch
-                    ),
-                    return_exceptions=True,
-                )
-                extractions: list[dict[str, Any]] = []
-                batch_retryable_failures = 0
-                for chunk, result in zip(batch, results, strict=True):
-                    if isinstance(result, BaseException):
-                        last_error = result
-                        retryable = self._is_retryable_extraction_error(result)
-                        if retryable:
-                            batch_retryable_failures += 1
-                        should_retry = retryable and round_index < self.settings.graph_retry_rounds
-                        if should_retry:
-                            retry_queue.append(chunk)
-                        elif not retryable:
-                            fatal_error = result
-                        extractions.append(
-                            {
-                                "chunk_id": chunk["id"],
-                                "entities": [],
-                                "relationships": [],
-                                "_checkpoint_status": "pending" if should_retry else "failed",
-                                "_checkpoint_error": str(result),
-                            }
+                    )
+                    in_flight[task] = chunk
+
+            fill_worker_slots()
+            try:
+                while in_flight:
+                    done, _ = await asyncio.wait(
+                        in_flight,
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    extractions: list[dict[str, Any]] = []
+                    provider_overloaded = False
+                    wave_successes = 0
+                    for task in done:
+                        chunk = in_flight.pop(task)
+                        try:
+                            result = task.result()
+                        except asyncio.CancelledError:
+                            raise
+                        except BaseException as error:
+                            last_error = error
+                            retryable = self._is_retryable_extraction_error(error)
+                            provider_overloaded = provider_overloaded or (
+                                isinstance(error, AIServiceError)
+                                and error.status_code in {408, 425, 429, 503, 504}
+                            )
+                            should_retry = (
+                                retryable
+                                and round_index < self.settings.graph_retry_rounds
+                            )
+                            if should_retry:
+                                # A slow/transiently failing chunk goes to the
+                                # tail. Healthy chunks immediately refill the
+                                # released worker slot.
+                                retry_queue.append(chunk)
+                            elif not retryable:
+                                fatal_error = error
+                            extractions.append(
+                                {
+                                    "chunk_id": chunk["id"],
+                                    "entities": [],
+                                    "relationships": [],
+                                    "_checkpoint_status": (
+                                        "pending" if should_retry else "failed"
+                                    ),
+                                    "_checkpoint_error": str(error),
+                                }
+                            )
+                        else:
+                            wave_successes += 1
+                            result["_checkpoint_status"] = "succeeded"
+                            result["_checkpoint_error"] = None
+                            extractions.append(result)
+
+                    if extractions:
+                        # Persist each completion wave instead of waiting for
+                        # the slowest request in a fixed-size batch.
+                        self._store_extractions(kb_id, extractions)
+                    stats = self.db.graph_checkpoint_stats(kb_id)
+                    self.db.update_graph_progress(
+                        kb_id,
+                        stage=stage,
+                        current=stats["succeeded"],
+                        total=stats["total"],
+                        failed_chunks=max(0, stats["total"] - stats["succeeded"]),
+                    )
+                    if fatal_error is not None:
+                        break
+                    if provider_overloaded and target_concurrency > 1:
+                        # Only explicit provider-pressure responses reduce the
+                        # rolling window. A slow request or malformed JSON
+                        # moves to the tail without penalizing healthy work.
+                        target_concurrency = max(
+                            1, (target_concurrency + 1) // 2
                         )
-                    else:
-                        result["_checkpoint_status"] = "succeeded"
-                        result["_checkpoint_error"] = None
-                        extractions.append(result)
-                self._store_extractions(kb_id, extractions)
-                stats = self.db.graph_checkpoint_stats(kb_id)
-                unresolved = stats["failed"] + len(retry_queue)
-                if round_index > 0:
-                    unresolved += max(0, len(remaining) - start - len(batch))
-                self.db.update_graph_progress(
-                    kb_id,
-                    stage=stage,
-                    current=stats["succeeded"],
-                    total=stats["total"],
-                    failed_chunks=unresolved,
-                )
-                if fatal_error is not None:
-                    break
-                start += len(batch)
-                if (
-                    concurrency > 1
-                    and batch_retryable_failures / max(1, len(batch)) >= 0.25
-                ):
-                    # Reduce pressure immediately for the rest of this pass instead
-                    # of waiting until every chunk has already hit the provider.
-                    concurrency = max(1, (concurrency + 1) // 2)
-                    semaphore = asyncio.Semaphore(concurrency)
+                        success_streak = 0
+                    elif wave_successes:
+                        success_streak += wave_successes
+                        recovery_threshold = max(4, target_concurrency * 2)
+                        if (
+                            target_concurrency < concurrency
+                            and success_streak >= recovery_threshold
+                        ):
+                            # Additive recovery prevents a transient 429 from
+                            # leaving the rest of the pass at single concurrency.
+                            target_concurrency += 1
+                            success_streak = 0
+                    fill_worker_slots()
+            finally:
+                for task in in_flight:
+                    if not task.done():
+                        task.cancel()
+                if in_flight:
+                    await asyncio.gather(*in_flight, return_exceptions=True)
             if fatal_error is not None:
                 break
             remaining = retry_queue
@@ -477,7 +564,7 @@ class GraphRAGService:
                     stage="retrying",
                     current=stats["succeeded"],
                     total=stats["total"],
-                    failed_chunks=len(remaining) + stats["failed"],
+                    failed_chunks=max(0, stats["total"] - stats["succeeded"]),
                 )
                 delay = min(
                     60.0,

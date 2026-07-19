@@ -85,14 +85,20 @@ class AIClient:
         return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
 
     async def _post_json(
-        self, url: str, payload: dict[str, Any], api_key: str, timeout: float
+        self,
+        url: str,
+        payload: dict[str, Any],
+        api_key: str,
+        timeout: float,
+        *,
+        max_attempts: int = 4,
     ) -> dict[str, Any]:
         if api_key.strip() in API_KEY_PLACEHOLDERS:
             raise AIServiceError("模型服务 API Key 未配置，请先运行 init.py 或检查 .env")
         client = self._http_client()
         last_error: Exception | None = None
         response: httpx.Response | None = None
-        max_attempts = 4
+        max_attempts = max(1, int(max_attempts))
         for attempt in range(max_attempts):
             try:
                 response = await client.post(
@@ -262,6 +268,9 @@ class AIClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         json_mode: bool = False,
+        enable_thinking: bool | None = None,
+        request_timeout: float | None = None,
+        max_attempts: int = 4,
     ) -> str:
         if not self.settings.chat_model:
             raise AIServiceError("CHAT_MODEL 未配置")
@@ -274,12 +283,37 @@ class AIClient:
         }
         if json_mode:
             payload["response_format"] = {"type": "json_object"}
-        data = await self._post_json(
-            f"{self.settings.effective_chat_base_url.rstrip('/')}/chat/completions",
-            payload,
-            self.settings.effective_chat_api_key,
-            self.settings.chat_timeout,
-        )
+        if enable_thinking is not None:
+            payload["enable_thinking"] = enable_thinking
+        url = f"{self.settings.effective_chat_base_url.rstrip('/')}/chat/completions"
+        timeout = self.settings.chat_timeout if request_timeout is None else request_timeout
+        try:
+            data = await self._post_json(
+                url,
+                payload,
+                self.settings.effective_chat_api_key,
+                timeout,
+                max_attempts=max_attempts,
+            )
+        except AIServiceError as exc:
+            # OpenAI-compatible providers are not uniform about Qwen's
+            # enable_thinking extension. If a provider explicitly rejects the
+            # field, retry once without it instead of making GraphRAG unusable.
+            unsupported_thinking_toggle = (
+                enable_thinking is not None
+                and exc.status_code in {400, 415, 422}
+                and "enable_thinking" in str(exc).casefold()
+            )
+            if not unsupported_thinking_toggle:
+                raise
+            payload.pop("enable_thinking", None)
+            data = await self._post_json(
+                url,
+                payload,
+                self.settings.effective_chat_api_key,
+                timeout,
+                max_attempts=1,
+            )
         try:
             return str(data["choices"][0]["message"]["content"] or "")
         except (KeyError, IndexError, TypeError) as exc:

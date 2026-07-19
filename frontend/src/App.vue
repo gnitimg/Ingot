@@ -129,6 +129,13 @@ const graphProgressPercent = computed(() => {
   const value = current.value?.graph_progress_current || 0;
   return total ? Math.min(100, Math.round((value / total) * 100)) : 0;
 });
+const graphUnfinishedCount = computed(() => {
+  const kb = current.value;
+  if (!kb || !["extracting", "retrying"].includes(kb.graph_stage || "")) return 0;
+  const total = kb.graph_progress_total || 0;
+  const succeeded = Math.min(kb.graph_progress_current || 0, total);
+  return Math.max(0, total - succeeded);
+});
 const landingDocumentCount = computed(() => knowledgeBases.value.reduce((total, kb) => total + kb.document_count, 0));
 
 function isGraphResumable(kb: KnowledgeBase | null) {
@@ -1157,7 +1164,7 @@ onBeforeUnmount(() => {
           <div v-else-if="current.graph_status === 'stale' && current.graph_error" class="graph-build-alert graph-build-stale"><strong>图谱需要重新构建</strong><span>{{ current.graph_error }}</span></div>
           <div v-if="current.graph_status === 'building' || isGraphResumable(current)" class="graph-build-progress" :class="{ paused: isGraphResumable(current) }" role="progressbar" :aria-valuenow="graphProgressPercent" aria-valuemin="0" aria-valuemax="100">
             <div><strong>{{ graphProgressLabel(current) }}</strong><span>{{ graphProgressPercent }}%</span></div>
-            <p v-if="current.graph_failed_chunks">{{ current.graph_status === "paused" ? `${current.graph_failed_chunks} 个文本块尚未完成；点击继续构建会从检查点处理。` : current.graph_stage === "retrying" ? `${current.graph_failed_chunks} 个文本块正在降并发重试。` : `${current.graph_failed_chunks} 个文本块暂未成功，稍后会自动重试。` }}</p>
+            <p v-if="graphUnfinishedCount">{{ current.graph_status === "paused" ? `${graphUnfinishedCount} 个文本块尚未完成；点击继续构建会从检查点处理。` : current.graph_stage === "retrying" ? `${graphUnfinishedCount} 个文本块尚未完成，正在处理或等待队尾重试。` : `${graphUnfinishedCount} 个文本块尚未完成；慢请求会进入队尾，不会阻塞后续文本块。` }}</p>
             <div class="graph-progress-track"><span :style="{ width: `${graphProgressPercent}%` }" /></div>
           </div>
           <div class="upload-zone" :class="{ dragging }" @click="fileInput?.click()" @dragenter.prevent="dragging = true" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="handleDrop">

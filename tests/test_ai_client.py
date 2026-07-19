@@ -56,3 +56,30 @@ async def test_post_json_reuses_client_and_recovers_from_rate_limit(monkeypatch)
         assert result == {"ok": True}
         assert attempts == 3
         assert client._http_client() is shared_client
+
+
+@pytest.mark.asyncio
+async def test_chat_complete_forwards_graph_request_controls():
+    settings = Settings(
+        _env_file=None,
+        embedding_api_key="test-key",
+        chat_model="Qwen/Qwen3-8B",
+    )
+    client = AIClient(settings)
+    client._post_json = AsyncMock(  # type: ignore[method-assign]
+        return_value={"choices": [{"message": {"content": '{"ok":true}'}}]}
+    )
+
+    result = await client.chat_complete(
+        [{"role": "user", "content": "extract"}],
+        json_mode=True,
+        enable_thinking=False,
+        request_timeout=30,
+        max_attempts=2,
+    )
+
+    assert result == '{"ok":true}'
+    request = client._post_json.await_args
+    assert request.args[1]["enable_thinking"] is False
+    assert request.args[3] == 30
+    assert request.kwargs["max_attempts"] == 2

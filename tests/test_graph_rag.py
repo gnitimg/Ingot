@@ -74,6 +74,24 @@ class FlakyGraphAI(FakeGraphAI):
         return await super().chat_complete(messages, **kwargs)
 
 
+class SlowFirstChunkAI(FakeGraphAI):
+    def __init__(self):
+        self.slow_finished = False
+        self.third_started_before_slow_finished = False
+
+    async def chat_complete(self, messages, **kwargs):
+        if len(messages) > 1:
+            prompt = messages[-1]["content"]
+            if "测试文本 0" in prompt:
+                try:
+                    await asyncio.sleep(0.2)
+                finally:
+                    self.slow_finished = True
+            if "测试文本 2" in prompt:
+                self.third_started_before_slow_finished = not self.slow_finished
+        return await super().chat_complete(messages, **kwargs)
+
+
 def graph_fixture(tmp_path, chunk_count=2):
     settings = Settings(
         _env_file=None,
@@ -163,6 +181,22 @@ def test_transient_failure_is_retried_before_graph_is_ready(tmp_path):
     assert ai.extraction_calls == 4
 
 
+def test_slow_chunk_moves_to_retry_tail_without_blocking_worker_pool(tmp_path):
+    settings, database, kb_id = graph_fixture(tmp_path, chunk_count=3)
+    settings.graph_concurrency = 2
+    settings.graph_chunk_timeout = 0.05
+    settings.graph_retry_rounds = 0
+    ai = SlowFirstChunkAI()
+    service = GraphRAGService(database, ai, settings)
+
+    asyncio.run(service.rebuild(kb_id))
+
+    checkpoint = database.graph_checkpoint_stats(kb_id)
+    assert ai.third_started_before_slow_finished is True
+    assert checkpoint["succeeded"] == 2
+    assert checkpoint["failed"] == 1
+
+
 def test_total_timeout_pauses_and_resume_uses_checkpoint(tmp_path):
     settings, database, kb_id = graph_fixture(tmp_path, chunk_count=2)
     settings.graph_concurrency = 1
@@ -175,6 +209,7 @@ def test_total_timeout_pauses_and_resume_uses_checkpoint(tmp_path):
     checkpoint = database.graph_checkpoint_stats(kb_id)
     assert paused is not None
     assert paused["graph_status"] == "paused"
+    assert paused["graph_failed_chunks"] == 1
     assert checkpoint == {"total": 2, "processed": 1, "succeeded": 1, "failed": 0}
     assert len(database.pending_graph_chunks(kb_id)) == 1
 
