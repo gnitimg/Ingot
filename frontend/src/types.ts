@@ -1,4 +1,4 @@
-export type GraphStatus = "empty" | "stale" | "building" | "paused" | "ready" | "error";
+export type GraphStatus = "empty" | "stale" | "building" | "paused" | "partial" | "ready" | "error";
 export type RetrievalMode = "vector" | "graph_local" | "graph_global" | "hybrid";
 
 export interface KnowledgeBase {
@@ -81,6 +81,8 @@ export interface PublicSettings {
   graph_build_timeout: number;
   graph_retry_rounds: number;
   graph_retry_backoff: number;
+  graph_success_threshold: number;
+  graph_llm_entity_matching: boolean;
 }
 
 export interface SettingsUpdate {
@@ -134,6 +136,8 @@ export interface SettingsUpdate {
     build_timeout: number;
     retry_rounds: number;
     retry_backoff: number;
+    success_threshold: number;
+    llm_entity_matching: boolean;
   };
 }
 

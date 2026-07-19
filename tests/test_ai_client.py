@@ -4,7 +4,7 @@ import httpx
 import pytest
 
 from app.config import Settings
-from app.services.ai_client import AIClient
+from app.services.ai_client import AIClient, AIOutputTruncatedError
 
 
 @pytest.mark.asyncio
@@ -83,3 +83,69 @@ async def test_chat_complete_forwards_graph_request_controls():
     assert request.args[1]["enable_thinking"] is False
     assert request.args[3] == 30
     assert request.kwargs["max_attempts"] == 2
+
+
+@pytest.mark.asyncio
+async def test_chat_complete_sends_strict_json_schema():
+    settings = Settings(
+        _env_file=None,
+        embedding_api_key="test-key",
+        chat_model="Qwen/Qwen3-8B",
+    )
+    client = AIClient(settings)
+    client._post_json = AsyncMock(  # type: ignore[method-assign]
+        return_value={
+            "choices": [
+                {
+                    "finish_reason": "stop",
+                    "message": {"content": '{"items":[]}'},
+                }
+            ]
+        }
+    )
+    schema = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["items"],
+        "properties": {"items": {"type": "array", "items": {"type": "string"}}},
+    }
+
+    result = await client.chat_complete(
+        [{"role": "user", "content": "extract"}],
+        json_schema=schema,
+        schema_name="test_items",
+    )
+
+    assert result == '{"items":[]}'
+    payload = client._post_json.await_args.args[1]
+    assert payload["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {
+            "name": "test_items",
+            "strict": True,
+            "schema": schema,
+        },
+    }
+
+
+@pytest.mark.asyncio
+async def test_chat_complete_reports_length_truncation():
+    settings = Settings(
+        _env_file=None,
+        embedding_api_key="test-key",
+        chat_model="Qwen/Qwen3-8B",
+    )
+    client = AIClient(settings)
+    client._post_json = AsyncMock(  # type: ignore[method-assign]
+        return_value={
+            "choices": [
+                {
+                    "finish_reason": "length",
+                    "message": {"content": '{"entities": ['},
+                }
+            ]
+        }
+    )
+
+    with pytest.raises(AIOutputTruncatedError):
+        await client.chat_complete([{"role": "user", "content": "extract"}])

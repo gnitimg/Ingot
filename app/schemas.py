@@ -107,6 +107,8 @@ class GraphSettingsUpdate(BaseModel):
     build_timeout: float = Field(ge=60, le=86400)
     retry_rounds: int = Field(ge=0, le=5)
     retry_backoff: float = Field(ge=0.1, le=60)
+    success_threshold: float | None = Field(default=None, ge=1, le=100)
+    llm_entity_matching: bool | None = None
 
 
 class SettingsUpdate(BaseModel):

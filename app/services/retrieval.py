@@ -238,9 +238,22 @@ class RetrievalService:
 
 可用证据：
 """ + context
-        cleaned_history = [
-            {"role": item["role"], "content": item["content"][:6000]}
-            for item in history[-10:]
-            if item.get("role") in {"user", "assistant"} and item.get("content")
-        ]
+        cleaned_history_reversed: list[dict[str, str]] = []
+        remaining_history_chars = 24000
+        for item in reversed(history[-20:]):
+            if (
+                item.get("role") not in {"user", "assistant"}
+                or not item.get("content")
+                or remaining_history_chars <= 0
+            ):
+                continue
+            content = str(item["content"])[:6000]
+            content = content[:remaining_history_chars]
+            if not content:
+                continue
+            cleaned_history_reversed.append(
+                {"role": str(item["role"]), "content": content}
+            )
+            remaining_history_chars -= len(content)
+        cleaned_history = list(reversed(cleaned_history_reversed))
         return [{"role": "system", "content": system}, *cleaned_history, {"role": "user", "content": query}]

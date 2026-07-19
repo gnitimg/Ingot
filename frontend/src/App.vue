@@ -88,6 +88,7 @@ const graphStageLabels: Record<string, string> = {
   queued: "准备构建",
   extracting: "抽取实体关系",
   retrying: "降并发重试失败块",
+  matching: "匹配相似实体",
   communities: "生成图社区",
   embedding: "生成社区向量",
   completed: "图谱已构建",
@@ -116,10 +117,12 @@ const settingsSections = Object.keys(settingsSectionLabels) as RuntimeSettingsSe
 const graphInfo = computed(() => {
   const status = current.value?.graph_status || "empty";
   if (status === "building") return [graphProgressLabel(current.value), "building"] as [string, string];
+  if (status === "partial") return ["图谱部分就绪", "partial"] as [string, string];
   if (isGraphResumable(current.value)) return ["图谱构建已暂停", "paused"] as [string, string];
   return ({
     empty: ["图谱未构建", ""], stale: ["图谱待更新", ""], building: ["图谱构建中", "building"],
     paused: ["图谱构建已暂停", "paused"], ready: ["图谱已就绪", "ready"],
+    partial: ["图谱部分就绪", "partial"],
     error: ["图谱构建失败", "error"],
   } satisfies Record<GraphStatus, [string, string]>)[status];
 });
@@ -131,6 +134,7 @@ const graphProgressPercent = computed(() => {
 });
 const graphUnfinishedCount = computed(() => {
   const kb = current.value;
+  if (kb?.graph_status === "partial") return kb.graph_failed_chunks || 0;
   if (!kb || !["extracting", "retrying"].includes(kb.graph_stage || "")) return 0;
   const total = kb.graph_progress_total || 0;
   const succeeded = Math.min(kb.graph_progress_current || 0, total);
@@ -140,7 +144,7 @@ const landingDocumentCount = computed(() => knowledgeBases.value.reduce((total, 
 
 function isGraphResumable(kb: KnowledgeBase | null) {
   if (!kb) return false;
-  if (kb.graph_status === "paused") return true;
+  if (kb.graph_status === "paused" || kb.graph_status === "partial") return true;
   const error = kb.graph_error || "";
   return kb.graph_status === "error" && error.includes("图谱构建超过") && error.includes("自动停止");
 }
@@ -320,6 +324,8 @@ function settingsToForm(value: PublicSettings): SettingsUpdate {
       build_timeout: value.graph_build_timeout,
       retry_rounds: value.graph_retry_rounds,
       retry_backoff: value.graph_retry_backoff,
+      success_threshold: value.graph_success_threshold,
+      llm_entity_matching: value.graph_llm_entity_matching,
     },
   };
 }
@@ -907,6 +913,10 @@ async function syncWorkspace() {
         notify("知识图谱与社区索引已构建完成");
         if (activeTab.value === "graph") await loadGraph();
       }
+      if (kb.graph_status === "partial") {
+        notify(`图谱与社区已可使用，仍有 ${kb.graph_failed_chunks || 0} 个文本块可继续补全`);
+        if (activeTab.value === "graph") await loadGraph();
+      }
       if (kb.graph_status === "error") {
         notify(`图谱构建失败：${kb.graph_error || "未知错误"}`, "error");
       }
@@ -1143,8 +1153,8 @@ onBeforeUnmount(() => {
               <button class="guidance-card" @click="activeTab = 'documents'">
                 <span>01 / INGEST</span><strong>{{ current.document_count ? `管理 ${current.document_count} 份资料` : "导入第一批资料" }}</strong><p>上传 PDF、Office 文档、Markdown 或扫描图片，自动解析、OCR、切分并建立向量索引。</p><b>前往文档 →</b>
               </button>
-              <button class="guidance-card" @click="activeTab = current.graph_status === 'ready' ? 'graph' : 'documents'">
-                <span>02 / GRAPHRAG</span><strong>{{ current.graph_status === "building" ? graphProgressLabel(current) : isGraphResumable(current) ? "继续构建知识图谱" : current.graph_status === "ready" ? "浏览实体关系" : current.graph_status === "error" ? "检查并重新构建" : "构建知识图谱" }}</strong><p>从文本块提取实体与关系，形成可缩放、可拖动的关系网络和全局主题社区。</p><b>{{ current.graph_status === "ready" ? "打开图谱" : "查看构建入口" }} →</b>
+              <button class="guidance-card" @click="activeTab = ['ready', 'partial'].includes(current.graph_status) ? 'graph' : 'documents'">
+                <span>02 / GRAPHRAG</span><strong>{{ current.graph_status === "building" ? graphProgressLabel(current) : current.graph_status === "partial" ? "浏览图谱并继续补全" : isGraphResumable(current) ? "继续构建知识图谱" : current.graph_status === "ready" ? "浏览实体关系" : current.graph_status === "error" ? "检查并重新构建" : "构建知识图谱" }}</strong><p>从文本块提取实体与关系，形成可缩放、可拖动的关系网络和全局主题社区。</p><b>{{ ["ready", "partial"].includes(current.graph_status) ? "打开图谱" : "查看构建入口" }} →</b>
               </button>
               <button class="guidance-card" @click="activeTab = current.chunk_count ? 'chat' : 'documents'">
                 <span>03 / ASK</span><strong>基于证据开始问答</strong><p>使用向量、图谱局部、图谱全局或混合检索；回答会附带命中的原文与关系证据。</p><b>{{ current.chunk_count ? "开始提问" : "先导入资料" }} →</b>
@@ -1157,14 +1167,15 @@ onBeforeUnmount(() => {
         </section>
 
         <section v-show="activeTab === 'documents'" id="panel-documents" class="tab-panel" :class="{ active: activeTab === 'documents' }">
-          <div class="section-heading"><div><p class="eyebrow">INGESTION PIPELINE</p><h2>构建知识底座</h2><p>原生文本优先；图片和低文本密度 PDF 页面自动进入 OCR，再执行切分、向量化与索引。</p></div><div class="graph-build-actions"><button v-if="current.graph_status === 'building' || isGraphResumable(current)" class="button button-ghost button-stop" @click="stopGraph"><span class="button-icon">■</span>停止构建</button><button class="button button-secondary" :disabled="!current.chunk_count || current.graph_status === 'building'" @click="isGraphResumable(current) ? resumeGraph() : buildGraph()"><span class="button-icon">{{ isGraphResumable(current) ? "↻" : "⌘" }}</span>{{ current.graph_status === "building" ? "正在构建…" : isGraphResumable(current) ? "继续构建" : "构建 GraphRAG" }}</button></div></div>
+          <div class="section-heading"><div><p class="eyebrow">INGESTION PIPELINE</p><h2>构建知识底座</h2><p>原生文本优先；图片和低文本密度 PDF 页面自动进入 OCR，再执行切分、向量化与索引。</p></div><div class="graph-build-actions"><button v-if="current.graph_status === 'building' || (isGraphResumable(current) && current.graph_status !== 'partial')" class="button button-ghost button-stop" @click="stopGraph"><span class="button-icon">■</span>停止构建</button><button class="button button-secondary" :disabled="!current.chunk_count || current.graph_status === 'building'" @click="isGraphResumable(current) ? resumeGraph() : buildGraph()"><span class="button-icon">{{ isGraphResumable(current) ? "↻" : "⌘" }}</span>{{ current.graph_status === "building" ? "正在构建…" : current.graph_status === "partial" ? "继续补全" : isGraphResumable(current) ? "继续构建" : "构建 GraphRAG" }}</button></div></div>
           <div class="pipeline-strip"><span><i>01</i> 文档解析</span><b>→</b><span><i>02</i> OCR fallback</span><b>→</b><span><i>03</i> Chunk + Embed</span><b>→</b><span><i>04</i> Rerank / Graph</span></div>
-          <div v-if="isGraphResumable(current)" class="graph-build-alert graph-build-paused"><strong>图谱构建已暂停</strong><span>{{ current.graph_status === "paused" ? current.graph_error : "检测到旧版超时任务；点击继续后会保留现有实体关系，并仅重试尚未确认完成的文本块。" }}</span></div>
+          <div v-if="current.graph_status === 'partial'" class="graph-build-alert graph-build-partial"><strong>图谱已部分就绪</strong><span>{{ current.graph_error || "已达到自动建社区阈值，可正常浏览和问答；失败文本块仍保留在检查点中，可随时继续补全。" }}</span></div>
+          <div v-else-if="isGraphResumable(current)" class="graph-build-alert graph-build-paused"><strong>图谱构建已暂停</strong><span>{{ current.graph_status === "paused" ? current.graph_error : "检测到旧版超时任务；点击继续后会保留现有实体关系，并仅重试尚未确认完成的文本块。" }}</span></div>
           <div v-else-if="current.graph_status === 'error'" class="graph-build-alert"><strong>上次图谱构建未完成</strong><span>{{ current.graph_error || "未知错误，可重新发起构建。" }}</span></div>
           <div v-else-if="current.graph_status === 'stale' && current.graph_error" class="graph-build-alert graph-build-stale"><strong>图谱需要重新构建</strong><span>{{ current.graph_error }}</span></div>
           <div v-if="current.graph_status === 'building' || isGraphResumable(current)" class="graph-build-progress" :class="{ paused: isGraphResumable(current) }" role="progressbar" :aria-valuenow="graphProgressPercent" aria-valuemin="0" aria-valuemax="100">
             <div><strong>{{ graphProgressLabel(current) }}</strong><span>{{ graphProgressPercent }}%</span></div>
-            <p v-if="graphUnfinishedCount">{{ current.graph_status === "paused" ? `${graphUnfinishedCount} 个文本块尚未完成；点击继续构建会从检查点处理。` : current.graph_stage === "retrying" ? `${graphUnfinishedCount} 个文本块尚未完成，正在处理或等待队尾重试。` : `${graphUnfinishedCount} 个文本块尚未完成；慢请求会进入队尾，不会阻塞后续文本块。` }}</p>
+            <p v-if="graphUnfinishedCount">{{ current.graph_status === "partial" ? `${graphUnfinishedCount} 个文本块尚未完成；图谱已可使用，点击继续补全只会重试这些块。` : current.graph_status === "paused" ? `${graphUnfinishedCount} 个文本块尚未完成；点击继续构建会从检查点处理。` : current.graph_stage === "retrying" ? `${graphUnfinishedCount} 个文本块尚未完成，正在处理或等待队尾重试。` : `${graphUnfinishedCount} 个文本块尚未完成；慢请求会进入队尾，不会阻塞后续文本块。` }}</p>
             <div class="graph-progress-track"><span :style="{ width: `${graphProgressPercent}%` }" /></div>
           </div>
           <div class="upload-zone" :class="{ dragging }" @click="fileInput?.click()" @dragenter.prevent="dragging = true" @dragover.prevent="dragging = true" @dragleave.prevent="dragging = false" @drop.prevent="handleDrop">
@@ -1298,6 +1309,8 @@ onBeforeUnmount(() => {
                   <label class="config-field"><span>总任务超时（秒）</span><input v-model.number="settingsForm.graph.build_timeout" type="number" min="60" max="86400" required></label>
                   <label class="config-field"><span>自动重试轮数</span><input v-model.number="settingsForm.graph.retry_rounds" type="number" min="0" max="5" required><small>每轮自动减半并发；0 表示不做外层重试</small></label>
                   <label class="config-field"><span>重试退避基数（秒）</span><input v-model.number="settingsForm.graph.retry_backoff" type="number" min="0.1" max="60" step="0.1" required><small>结合指数退避与随机抖动，避免请求风暴</small></label>
+                  <label class="config-field"><span>自动建社区成功率（%）</span><input v-model.number="settingsForm.graph.success_threshold" type="number" min="1" max="100" step="0.1" required><small>默认 90%；达到阈值即生成图社区，失败块保留为可继续补全的检查点</small></label>
+                  <label class="config-field config-toggle"><span>对话模型实体匹配</span><input v-model="settingsForm.graph.llm_entity_matching" type="checkbox"><small>默认关闭；开启后仅用模型裁决名称相似的实体候选</small></label>
                 </div>
                 <div class="setting-card-footer"><button type="button" class="button setting-save-button" :disabled="savingSettings" @click="saveSettings('graph')">{{ savingSettingsSection === "graph" ? "保存中…" : "保存" }}</button></div>
               </article>
@@ -1310,7 +1323,6 @@ onBeforeUnmount(() => {
                   <label class="config-field"><span>确认新密码</span><input v-model="securityForm.confirm_password" type="password" maxlength="200" autocomplete="new-password" placeholder="再次输入新密码"></label>
                 </div>
                 <div class="setting-card-footer">
-                  <span>仅修改当前知识库；保存后当前会话会自动重新解锁。</span>
                   <button type="button" class="button setting-save-button" :disabled="savingPassword" @click="saveKnowledgeBasePassword">{{ savingPassword ? "保存中…" : "保存" }}</button>
                 </div>
               </article>

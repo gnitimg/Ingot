@@ -38,6 +38,11 @@ class AIServiceError(RuntimeError):
         )
 
 
+class AIOutputTruncatedError(AIServiceError):
+    def __init__(self) -> None:
+        super().__init__("模型输出达到长度上限，JSON 可能不完整", retryable=True)
+
+
 class AIClient:
     def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None):
         self.settings = settings
@@ -268,6 +273,8 @@ class AIClient:
         temperature: float | None = None,
         max_tokens: int | None = None,
         json_mode: bool = False,
+        json_schema: dict[str, Any] | None = None,
+        schema_name: str = "structured_response",
         enable_thinking: bool | None = None,
         request_timeout: float | None = None,
         max_attempts: int = 4,
@@ -281,41 +288,62 @@ class AIClient:
             "temperature": self.settings.chat_temperature if temperature is None else temperature,
             "max_tokens": max_tokens or self.settings.chat_max_tokens,
         }
-        if json_mode:
+        if json_schema is not None:
+            payload["response_format"] = {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": schema_name,
+                    "strict": True,
+                    "schema": json_schema,
+                },
+            }
+        elif json_mode:
             payload["response_format"] = {"type": "json_object"}
         if enable_thinking is not None:
             payload["enable_thinking"] = enable_thinking
         url = f"{self.settings.effective_chat_base_url.rstrip('/')}/chat/completions"
         timeout = self.settings.chat_timeout if request_timeout is None else request_timeout
+        fallback_count = 0
+        while True:
+            try:
+                data = await self._post_json(
+                    url,
+                    payload,
+                    self.settings.effective_chat_api_key,
+                    timeout,
+                    max_attempts=max_attempts if fallback_count == 0 else 1,
+                )
+                break
+            except AIServiceError as exc:
+                detail = str(exc).casefold()
+                unsupported_status = exc.status_code in {400, 415, 422}
+                unsupported_schema = (
+                    unsupported_status
+                    and payload.get("response_format", {}).get("type") == "json_schema"
+                    and any(
+                        marker in detail
+                        for marker in ("json_schema", "json schema", "response_format")
+                    )
+                )
+                unsupported_thinking_toggle = (
+                    unsupported_status
+                    and "enable_thinking" in payload
+                    and "enable_thinking" in detail
+                )
+                if unsupported_schema:
+                    payload["response_format"] = {"type": "json_object"}
+                elif unsupported_thinking_toggle:
+                    payload.pop("enable_thinking", None)
+                else:
+                    raise
+                fallback_count += 1
+                if fallback_count > 2:
+                    raise
         try:
-            data = await self._post_json(
-                url,
-                payload,
-                self.settings.effective_chat_api_key,
-                timeout,
-                max_attempts=max_attempts,
-            )
-        except AIServiceError as exc:
-            # OpenAI-compatible providers are not uniform about Qwen's
-            # enable_thinking extension. If a provider explicitly rejects the
-            # field, retry once without it instead of making GraphRAG unusable.
-            unsupported_thinking_toggle = (
-                enable_thinking is not None
-                and exc.status_code in {400, 415, 422}
-                and "enable_thinking" in str(exc).casefold()
-            )
-            if not unsupported_thinking_toggle:
-                raise
-            payload.pop("enable_thinking", None)
-            data = await self._post_json(
-                url,
-                payload,
-                self.settings.effective_chat_api_key,
-                timeout,
-                max_attempts=1,
-            )
-        try:
-            return str(data["choices"][0]["message"]["content"] or "")
+            choice = data["choices"][0]
+            if str(choice.get("finish_reason") or "").casefold() == "length":
+                raise AIOutputTruncatedError()
+            return str(choice["message"]["content"] or "")
         except (KeyError, IndexError, TypeError) as exc:
             raise AIServiceError("对话模型返回格式不正确") from exc
 

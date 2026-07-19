@@ -40,6 +40,7 @@ retrieval = RetrievalService(db, ai, settings)
 static_dir = Path(__file__).parent / "static"
 settings_update_lock = asyncio.Lock()
 graph_tasks: dict[str, asyncio.Task[None]] = {}
+GRAPH_USABLE_STATUSES = {"ready", "partial"}
 kb_access_tokens: dict[str, set[str]] = {}
 
 RUNTIME_ENV_KEYS = {
@@ -79,6 +80,8 @@ RUNTIME_ENV_KEYS = {
     "graph_build_timeout": "GRAPH_BUILD_TIMEOUT",
     "graph_retry_rounds": "GRAPH_RETRY_ROUNDS",
     "graph_retry_backoff": "GRAPH_RETRY_BACKOFF",
+    "graph_success_threshold": "GRAPH_SUCCESS_THRESHOLD",
+    "graph_llm_entity_matching": "GRAPH_LLM_ENTITY_MATCHING",
 }
 
 
@@ -146,6 +149,16 @@ def _candidate_settings(payload: SettingsUpdate) -> Settings:
         graph_build_timeout=payload.graph.build_timeout,
         graph_retry_rounds=payload.graph.retry_rounds,
         graph_retry_backoff=payload.graph.retry_backoff,
+        graph_success_threshold=(
+            settings.graph_success_threshold
+            if payload.graph.success_threshold is None
+            else payload.graph.success_threshold
+        ),
+        graph_llm_entity_matching=(
+            settings.graph_llm_entity_matching
+            if payload.graph.llm_entity_matching is None
+            else payload.graph.llm_entity_matching
+        ),
     )
     return Settings(_env_file=None, **values)
 
@@ -154,6 +167,8 @@ def _candidate_settings(payload: SettingsUpdate) -> Settings:
 async def lifespan(_: FastAPI):
     settings.ensure_directories()
     db.initialize()
+    for knowledge_base in db.list_knowledge_bases():
+        begin_partial_finalization(knowledge_base)
     try:
         yield
     finally:
@@ -217,9 +232,17 @@ def model_error(exc: Exception) -> HTTPException:
     return HTTPException(status_code=502, detail=str(exc))
 
 
-async def run_graph_build(kb_id: str, *, resume: bool = False) -> None:
+async def run_graph_build(
+    kb_id: str,
+    *,
+    resume: bool = False,
+    finalize_partial: bool = False,
+) -> None:
     try:
-        await graph_rag.rebuild(kb_id, resume=resume)
+        if finalize_partial:
+            await graph_rag.finalize_partial(kb_id)
+        else:
+            await graph_rag.rebuild(kb_id, resume=resume)
     finally:
         current_task = asyncio.current_task()
         if graph_tasks.get(kb_id) is current_task:
@@ -244,19 +267,73 @@ async def cancel_active_graph_task(kb_id: str) -> None:
         await asyncio.gather(task, return_exceptions=True)
 
 
-def launch_graph_task(kb_id: str, *, resume: bool) -> None:
+def launch_graph_task(
+    kb_id: str,
+    *,
+    resume: bool,
+    finalize_partial: bool = False,
+) -> None:
     task = asyncio.create_task(
-        run_graph_build(kb_id, resume=resume),
-        name=f"graph-{'resume' if resume else 'build'}-{kb_id}",
+        run_graph_build(
+            kb_id,
+            resume=resume,
+            finalize_partial=finalize_partial,
+        ),
+        name=(
+            f"graph-finalize-{kb_id}"
+            if finalize_partial
+            else f"graph-{'resume' if resume else 'build'}-{kb_id}"
+        ),
     )
     graph_tasks[kb_id] = task
     task.add_done_callback(lambda completed: forget_graph_task(kb_id, completed))
+
+
+def begin_partial_finalization(knowledge_base: dict) -> dict | None:
+    if knowledge_base.get("graph_status") != "paused":
+        return None
+    kb_id = str(knowledge_base["id"])
+    checkpoint = db.graph_checkpoint_stats(kb_id)
+    success_ratio = (
+        checkpoint["succeeded"] / checkpoint["total"] * 100
+        if checkpoint["total"]
+        else 0.0
+    )
+    if (
+        not checkpoint["succeeded"]
+        or success_ratio < settings.graph_success_threshold
+    ):
+        return None
+    db.update_graph_progress(
+        kb_id,
+        stage=(
+            "matching"
+            if settings.graph_llm_entity_matching
+            else "communities"
+        ),
+        current=checkpoint["succeeded"],
+        total=checkpoint["total"],
+        failed_chunks=checkpoint["total"] - checkpoint["succeeded"],
+    )
+    launch_graph_task(kb_id, resume=False, finalize_partial=True)
+    return {
+        "status": "building",
+        "resumed": True,
+        "finalizing_partial": True,
+        "stage": "matching" if settings.graph_llm_entity_matching else "communities",
+        "current": checkpoint["succeeded"],
+        "total": checkpoint["total"],
+        "failed": checkpoint["failed"],
+    }
 
 
 def resume_graph_from_checkpoint(kb_id: str, knowledge_base: dict) -> dict:
     checkpoint = db.graph_checkpoint_stats(kb_id)
     if not checkpoint["total"]:
         raise HTTPException(status_code=409, detail="构建检查点不存在，请从零重新构建")
+    finalizing = begin_partial_finalization(knowledge_base)
+    if finalizing is not None:
+        return finalizing
     db.resume_graph_build(kb_id)
     checkpoint = db.graph_checkpoint_stats(kb_id)
     launch_graph_task(kb_id, resume=True)
@@ -354,6 +431,8 @@ async def public_settings() -> dict:
         "graph_build_timeout": settings.graph_build_timeout,
         "graph_retry_rounds": settings.graph_retry_rounds,
         "graph_retry_backoff": settings.graph_retry_backoff,
+        "graph_success_threshold": settings.graph_success_threshold,
+        "graph_llm_entity_matching": settings.graph_llm_entity_matching,
     }
 
 
@@ -486,7 +565,10 @@ async def search(kb_id: str, payload: SearchRequest, request: Request) -> dict:
     knowledge_base = require_knowledge_base_access(kb_id, request)
     if not knowledge_base["chunk_count"]:
         raise HTTPException(status_code=400, detail="知识库中还没有可检索的文档")
-    if payload.mode.startswith("graph") and knowledge_base["graph_status"] != "ready":
+    if (
+        payload.mode.startswith("graph")
+        and knowledge_base["graph_status"] not in GRAPH_USABLE_STATUSES
+    ):
         raise HTTPException(status_code=409, detail="图谱尚未构建完成")
     try:
         return await retrieval.search(kb_id, payload.query, payload.mode, payload.top_k)
@@ -499,10 +581,13 @@ async def chat(kb_id: str, payload: ChatRequest, request: Request) -> StreamingR
     knowledge_base = require_knowledge_base_access(kb_id, request)
     if not knowledge_base["chunk_count"]:
         raise HTTPException(status_code=400, detail="请先上传并解析文档")
-    if payload.mode in {"graph_local", "graph_global"} and knowledge_base["graph_status"] != "ready":
+    if (
+        payload.mode in {"graph_local", "graph_global"}
+        and knowledge_base["graph_status"] not in GRAPH_USABLE_STATUSES
+    ):
         raise HTTPException(status_code=409, detail="图谱尚未构建完成；可先使用向量模式")
     effective_mode = payload.mode
-    if payload.mode == "hybrid" and knowledge_base["graph_status"] != "ready":
+    if payload.mode == "hybrid" and knowledge_base["graph_status"] not in GRAPH_USABLE_STATUSES:
         effective_mode = "vector"
     try:
         result = await retrieval.search(kb_id, payload.query, effective_mode, payload.top_k)
@@ -557,7 +642,7 @@ async def rebuild_graph(kb_id: str, request: Request) -> dict:
     # let an old button accidentally clear partial graph data.
     checkpoint = db.graph_checkpoint_stats(kb_id)
     if checkpoint["total"]:
-        if knowledge_base["graph_status"] != "paused":
+        if knowledge_base["graph_status"] not in {"paused", "partial"}:
             db.pause_graph_build(kb_id, "检测到未完成的构建检查点，可从当前进度继续")
             knowledge_base = require_knowledge_base(kb_id)
         return resume_graph_from_checkpoint(kb_id, knowledge_base)
@@ -594,10 +679,10 @@ async def resume_graph(kb_id: str, request: Request) -> dict:
     if knowledge_base["graph_status"] in {"error", "paused"} and db.recover_legacy_graph_timeout(kb_id):
         knowledge_base = require_knowledge_base(kb_id)
     checkpoint = db.graph_checkpoint_stats(kb_id)
-    if checkpoint["total"] and knowledge_base["graph_status"] != "paused":
+    if checkpoint["total"] and knowledge_base["graph_status"] not in {"paused", "partial"}:
         db.pause_graph_build(kb_id, "检测到未完成的构建检查点，可从当前进度继续")
         knowledge_base = require_knowledge_base(kb_id)
-    if knowledge_base["graph_status"] != "paused":
+    if knowledge_base["graph_status"] not in {"paused", "partial"}:
         raise HTTPException(status_code=409, detail="当前图谱任务不处于暂停状态")
     return resume_graph_from_checkpoint(kb_id, knowledge_base)
 

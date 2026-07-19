@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
+import hashlib
 import json
 import random
 import re
@@ -9,7 +11,7 @@ from typing import Any
 
 from app.config import Settings
 from app.database import Database, new_id, utc_now, vector_to_blob
-from app.services.ai_client import AIClient, AIServiceError
+from app.services.ai_client import AIClient, AIOutputTruncatedError, AIServiceError
 
 
 GRAPH_SYSTEM_PROMPT = """你是严谨的知识图谱工程师。请从文本中抽取对问答有价值的实体与明确关系。
@@ -19,6 +21,86 @@ GRAPH_SYSTEM_PROMPT = """你是严谨的知识图谱工程师。请从文本中�
   "relationships": [{"source": "源实体", "target": "目标实体", "predicate": "简洁关系", "description": "有事实依据的关系说明", "weight": 1.0}]
 }
 要求：实体名保持原文语言；同一实体使用一致名称；不得推测文本没有表达的事实；没有内容时返回空数组。"""
+
+
+def graph_extraction_schema(max_entities: int = 12, max_relationships: int = 18) -> dict[str, Any]:
+    entity = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["name", "type", "description"],
+        "properties": {
+            "name": {"type": "string"},
+            "type": {"type": "string"},
+            "description": {"type": "string"},
+        },
+    }
+    relationship = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["source", "target", "predicate", "description", "weight"],
+        "properties": {
+            "source": {"type": "string"},
+            "target": {"type": "string"},
+            "predicate": {"type": "string"},
+            "description": {"type": "string"},
+            "weight": {"type": "number"},
+        },
+    }
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["entities", "relationships"],
+        "properties": {
+            "entities": {
+                "type": "array",
+                "maxItems": max_entities,
+                "items": entity,
+            },
+            "relationships": {
+                "type": "array",
+                "maxItems": max_relationships,
+                "items": relationship,
+            },
+        },
+    }
+
+
+def entity_match_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["matches"],
+        "properties": {
+            "matches": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": ["pair_id", "same_entity", "canonical"],
+                    "properties": {
+                        "pair_id": {"type": "integer"},
+                        "same_entity": {"type": "boolean"},
+                        "canonical": {
+                            "type": "string",
+                            "enum": ["left", "right"],
+                        },
+                    },
+                },
+            }
+        },
+    }
+
+
+def community_summary_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["title", "summary"],
+        "properties": {
+            "title": {"type": "string"},
+            "summary": {"type": "string"},
+        },
+    }
 
 
 def normalize_entity_name(name: str) -> str:
@@ -60,6 +142,80 @@ class GraphRAGService:
             ),
         )
 
+    async def _request_graph_json(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        schema: dict[str, Any],
+        schema_name: str,
+        max_tokens: int,
+        max_attempts: int,
+    ) -> str:
+        try:
+            return await self.ai.chat_complete(
+                messages,
+                temperature=0,
+                max_tokens=max_tokens,
+                json_mode=True,
+                json_schema=schema,
+                schema_name=schema_name,
+                enable_thinking=False,
+                request_timeout=self._graph_request_timeout(),
+                max_attempts=max_attempts,
+            )
+        except AIServiceError as exc:
+            if not exc.json_mode_unsupported:
+                raise
+            return await self.ai.chat_complete(
+                messages,
+                temperature=0,
+                max_tokens=max_tokens,
+                json_mode=False,
+                enable_thinking=False,
+                request_timeout=self._graph_request_timeout(),
+                max_attempts=1,
+            )
+
+    async def _compact_reextract(
+        self,
+        messages: list[dict[str, str]],
+    ) -> dict[str, Any]:
+        compact_messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": (
+                    "上一次输出过长或无法解析。请重新抽取并显著压缩："
+                    "最多 8 个实体、12 条关系，描述不超过 40 字；"
+                    "必须返回完整 JSON，不得输出解释。"
+                ),
+            },
+        ]
+        response = await self._request_graph_json(
+            compact_messages,
+            schema=graph_extraction_schema(8, 12),
+            schema_name="compact_graph_extraction",
+            max_tokens=2600,
+            max_attempts=1,
+        )
+        return parse_json_object(response)
+
+    async def _repair_graph_json(self, response: str) -> dict[str, Any]:
+        repair_prompt = """下面是实体关系抽取结果，但 JSON 语法无效。
+只修复 JSON 语法和字段结构，不得增加、删除或改写任何事实。
+若末尾不完整，只保留已经完整出现的实体和关系；必须返回完整 JSON。
+
+待修复内容：
+""" + response[:12000]
+        repaired = await self._request_graph_json(
+            [{"role": "user", "content": repair_prompt}],
+            schema=graph_extraction_schema(),
+            schema_name="repaired_graph_extraction",
+            max_tokens=3000,
+            max_attempts=1,
+        )
+        return parse_json_object(repaired)
+
     async def _extract_chunk(self, chunk: dict[str, Any]) -> dict[str, Any]:
         extraction_limits = (
             "\n\n抽取约束：最多返回 12 个实体、18 条关系；"
@@ -77,31 +233,23 @@ class GraphRAGService:
             {"role": "user", "content": prompt},
         ]
         try:
-            response = await self.ai.chat_complete(
+            response = await self._request_graph_json(
                 messages,
-                temperature=0,
-                max_tokens=1600,
-                json_mode=True,
-                enable_thinking=False,
-                request_timeout=self._graph_request_timeout(),
+                schema=graph_extraction_schema(),
+                schema_name="graph_extraction",
+                max_tokens=2400,
                 max_attempts=2,
             )
-        except AIServiceError as exc:
-            # Plain JSON fallback is only for providers that explicitly do
-            # not support response_format. Falling back after 429/timeouts
-            # would immediately double the request storm.
-            if not exc.json_mode_unsupported:
-                raise
-            response = await self.ai.chat_complete(
-                messages,
-                temperature=0,
-                max_tokens=1600,
-                json_mode=False,
-                enable_thinking=False,
-                request_timeout=self._graph_request_timeout(),
-                max_attempts=1,
-            )
-        result = parse_json_object(response)
+        except AIOutputTruncatedError:
+            result = await self._compact_reextract(messages)
+        else:
+            try:
+                result = parse_json_object(response)
+            except (json.JSONDecodeError, ValueError):
+                try:
+                    result = await self._repair_graph_json(response)
+                except (AIServiceError, json.JSONDecodeError, ValueError):
+                    result = await self._compact_reextract(messages)
         result["chunk_id"] = chunk["id"]
         return result
 
@@ -223,6 +371,262 @@ class GraphRAGService:
                 )
 
     @staticmethod
+    def _entity_match_candidates(
+        entities: list[dict[str, Any]],
+        *,
+        limit: int = 160,
+    ) -> list[tuple[float, dict[str, Any], dict[str, Any]]]:
+        candidates: list[tuple[float, dict[str, Any], dict[str, Any]]] = []
+        for index, left in enumerate(entities):
+            left_name = normalize_entity_name(str(left["name"]))
+            for right in entities[index + 1 :]:
+                right_name = normalize_entity_name(str(right["name"]))
+                if not left_name or not right_name or left_name == right_name:
+                    continue
+                left_type = str(left.get("entity_type") or "")
+                right_type = str(right.get("entity_type") or "")
+                if (
+                    left_type
+                    and right_type
+                    and left_type != right_type
+                    and "概念" not in {left_type, right_type}
+                    and "其他" not in {left_type, right_type}
+                ):
+                    continue
+                ratio = difflib.SequenceMatcher(None, left_name, right_name).ratio()
+                shorter, longer = sorted((left_name, right_name), key=len)
+                contained = len(shorter) >= 4 and shorter in longer and ratio >= 0.55
+                if ratio >= 0.72 or contained:
+                    candidates.append((ratio, left, right))
+        candidates.sort(
+            key=lambda item: (
+                -item[0],
+                str(item[1]["name"]),
+                str(item[2]["name"]),
+            )
+        )
+        return candidates[:limit]
+
+    def _merge_entity_groups(
+        self,
+        kb_id: str,
+        entities: list[dict[str, Any]],
+        groups: list[list[str]],
+        preferred_votes: dict[str, int],
+    ) -> int:
+        entity_map = {str(entity["id"]): entity for entity in entities}
+        id_map: dict[str, str] = {}
+        for group in groups:
+            if len(group) < 2:
+                continue
+            canonical = max(
+                group,
+                key=lambda entity_id: (
+                    preferred_votes.get(entity_id, 0),
+                    int(entity_map[entity_id].get("mention_count") or 0),
+                    len(str(entity_map[entity_id].get("description") or "")),
+                    -len(str(entity_map[entity_id].get("name") or "")),
+                    entity_id,
+                ),
+            )
+            for entity_id in group:
+                id_map[entity_id] = canonical
+        duplicates = [entity_id for entity_id, target in id_map.items() if entity_id != target]
+        if not duplicates:
+            return 0
+
+        with self.db.connection() as connection:
+            relationships = connection.execute(
+                """SELECT id, source_id, target_id, predicate, description, weight,
+                          evidence_chunk_id, created_at
+                   FROM relationships WHERE kb_id = ?""",
+                (kb_id,),
+            ).fetchall()
+            for duplicate in duplicates:
+                canonical = id_map[duplicate]
+                connection.execute(
+                    """INSERT INTO entity_chunks(entity_id, chunk_id, mention_count)
+                       SELECT ?, chunk_id, mention_count
+                       FROM entity_chunks WHERE entity_id = ?
+                       ON CONFLICT(entity_id, chunk_id) DO UPDATE SET
+                           mention_count = entity_chunks.mention_count + excluded.mention_count""",
+                    (canonical, duplicate),
+                )
+                connection.execute(
+                    "DELETE FROM entity_chunks WHERE entity_id = ?",
+                    (duplicate,),
+                )
+
+            merged_relations: dict[tuple[str, str, str], dict[str, Any]] = {}
+            for relation in relationships:
+                source_id = id_map.get(str(relation["source_id"]), str(relation["source_id"]))
+                target_id = id_map.get(str(relation["target_id"]), str(relation["target_id"]))
+                if source_id == target_id:
+                    continue
+                key = (source_id, target_id, str(relation["predicate"]))
+                existing = merged_relations.get(key)
+                candidate = dict(relation)
+                candidate["source_id"] = source_id
+                candidate["target_id"] = target_id
+                if existing is None:
+                    merged_relations[key] = candidate
+                    continue
+                existing["weight"] = max(
+                    float(existing.get("weight") or 1.0),
+                    float(candidate.get("weight") or 1.0),
+                )
+                if len(str(candidate.get("description") or "")) > len(
+                    str(existing.get("description") or "")
+                ):
+                    existing["description"] = candidate.get("description") or ""
+
+            connection.execute("DELETE FROM relationships WHERE kb_id = ?", (kb_id,))
+            connection.executemany(
+                """INSERT INTO relationships
+                   (id, kb_id, source_id, target_id, predicate, description, weight,
+                    evidence_chunk_id, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                [
+                    (
+                        new_id(),
+                        kb_id,
+                        relation["source_id"],
+                        relation["target_id"],
+                        relation["predicate"],
+                        relation.get("description") or "",
+                        relation.get("weight") or 1.0,
+                        relation.get("evidence_chunk_id"),
+                        relation.get("created_at") or utc_now(),
+                    )
+                    for relation in merged_relations.values()
+                ],
+            )
+            connection.executemany(
+                "DELETE FROM entities WHERE id = ?",
+                [(entity_id,) for entity_id in duplicates],
+            )
+        return len(duplicates)
+
+    async def _resolve_entity_aliases_with_llm(self, kb_id: str) -> int:
+        entities = self.db.fetch_all(
+            """SELECT e.id, e.name, e.entity_type, e.description,
+                      COALESCE(SUM(ec.mention_count), 0) AS mention_count
+               FROM entities e
+               LEFT JOIN entity_chunks ec ON ec.entity_id = e.id
+               WHERE e.kb_id = ?
+               GROUP BY e.id""",
+            (kb_id,),
+        )
+        candidates = self._entity_match_candidates(entities)
+        if not candidates:
+            return 0
+        stats = self.db.graph_checkpoint_stats(kb_id)
+        unresolved = max(0, stats["total"] - stats["succeeded"])
+        self.db.update_graph_progress(
+            kb_id,
+            stage="matching",
+            current=0,
+            total=len(candidates),
+            failed_chunks=unresolved,
+        )
+
+        parent = {str(entity["id"]): str(entity["id"]) for entity in entities}
+        preferred_votes: dict[str, int] = defaultdict(int)
+
+        def find(entity_id: str) -> str:
+            while parent[entity_id] != entity_id:
+                parent[entity_id] = parent[parent[entity_id]]
+                entity_id = parent[entity_id]
+            return entity_id
+
+        def union(left_id: str, right_id: str) -> None:
+            left_root, right_root = find(left_id), find(right_id)
+            if left_root != right_root:
+                parent[right_root] = left_root
+
+        completed = 0
+        for start in range(0, len(candidates), 20):
+            batch = candidates[start : start + 20]
+            prompt_pairs = [
+                {
+                    "pair_id": start + offset,
+                    "left": {
+                        "name": left["name"],
+                        "type": left["entity_type"],
+                        "description": left["description"],
+                    },
+                    "right": {
+                        "name": right["name"],
+                        "type": right["entity_type"],
+                        "description": right["description"],
+                    },
+                }
+                for offset, (_, left, right) in enumerate(batch)
+            ]
+            prompt = (
+                "判断每一对名称是否指向同一个现实实体或同一个明确概念。"
+                "只有证据充分时 same_entity 才能为 true；上下位概念、相关模块、"
+                "同类产品不能合并。canonical 选择更完整、正式的名称。\n\n"
+                + json.dumps(prompt_pairs, ensure_ascii=False)
+            )
+            try:
+                response = await self._request_graph_json(
+                    [{"role": "user", "content": prompt}],
+                    schema=entity_match_schema(),
+                    schema_name="entity_alias_matches",
+                    max_tokens=1400,
+                    max_attempts=1,
+                )
+                parsed = parse_json_object(response)
+            except (AIServiceError, json.JSONDecodeError, ValueError):
+                completed += len(batch)
+                self.db.update_graph_progress(
+                    kb_id,
+                    stage="matching",
+                    current=completed,
+                    total=len(candidates),
+                    failed_chunks=unresolved,
+                )
+                continue
+            batch_by_id = {
+                start + offset: (left, right)
+                for offset, (_, left, right) in enumerate(batch)
+            }
+            for match in parsed.get("matches", []):
+                if not isinstance(match, dict) or not match.get("same_entity"):
+                    continue
+                try:
+                    pair_id = int(match.get("pair_id"))
+                except (TypeError, ValueError):
+                    continue
+                pair = batch_by_id.get(pair_id)
+                if pair is None:
+                    continue
+                left, right = pair
+                left_id, right_id = str(left["id"]), str(right["id"])
+                union(left_id, right_id)
+                preferred = left_id if match.get("canonical") == "left" else right_id
+                preferred_votes[preferred] += 1
+            completed += len(batch)
+            self.db.update_graph_progress(
+                kb_id,
+                stage="matching",
+                current=completed,
+                total=len(candidates),
+                failed_chunks=unresolved,
+            )
+
+        grouped: dict[str, list[str]] = defaultdict(list)
+        for entity_id in parent:
+            grouped[find(entity_id)].append(entity_id)
+        return self._merge_entity_groups(
+            kb_id,
+            entities,
+            list(grouped.values()),
+            preferred_votes,
+        )
+
+    @staticmethod
     def _detect_communities(entity_ids: list[str], relations: list[dict[str, Any]]) -> list[list[str]]:
         adjacency: dict[str, dict[str, float]] = {entity_id: {} for entity_id in entity_ids}
         for relation in relations:
@@ -282,13 +686,11 @@ class GraphRAGService:
 %s""" % ("\n".join(entity_lines), "\n".join(relation_lines))
         try:
             response = await asyncio.wait_for(
-                self.ai.chat_complete(
+                self._request_graph_json(
                     [{"role": "user", "content": prompt}],
-                    temperature=0,
+                    schema=community_summary_schema(),
+                    schema_name="community_summary",
                     max_tokens=700,
-                    json_mode=True,
-                    enable_thinking=False,
-                    request_timeout=self._graph_request_timeout(),
                     max_attempts=2,
                 ),
                 timeout=self.settings.graph_chunk_timeout,
@@ -300,10 +702,82 @@ class GraphRAGService:
         except Exception:
             return fallback_title[:80], fallback_summary[:2000]
 
+    @staticmethod
+    def _community_id(
+        kb_id: str,
+        members: list[dict[str, Any]],
+        relations: list[dict[str, Any]],
+    ) -> str:
+        signature = {
+            "members": sorted(
+                (
+                    str(member["id"]),
+                    str(member.get("name") or ""),
+                    str(member.get("entity_type") or ""),
+                    str(member.get("description") or ""),
+                )
+                for member in members
+            ),
+            "relations": sorted(
+                (
+                    str(relation.get("source_id") or ""),
+                    str(relation.get("target_id") or ""),
+                    str(relation.get("predicate") or ""),
+                    str(relation.get("description") or ""),
+                    float(relation.get("weight") or 1.0),
+                )
+                for relation in relations
+            ),
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                signature,
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()
+        return f"community-{kb_id[:8]}-{digest[:24]}"
+
+    def _store_community_summary(
+        self,
+        kb_id: str,
+        community_id: str,
+        member_ids: list[str],
+        title: str,
+        summary: str,
+    ) -> None:
+        with self.db.connection() as connection:
+            connection.execute(
+                """INSERT INTO communities
+                   (id, kb_id, title, summary, member_count, embedding,
+                    embedding_dim, created_at)
+                   VALUES (?, ?, ?, ?, ?, NULL, 0, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       title = excluded.title,
+                       summary = excluded.summary,
+                       member_count = excluded.member_count,
+                       embedding = NULL,
+                       embedding_dim = 0""",
+                (
+                    community_id,
+                    kb_id,
+                    title,
+                    summary,
+                    len(member_ids),
+                    utc_now(),
+                ),
+            )
+            connection.execute(
+                "DELETE FROM community_entities WHERE community_id = ?",
+                (community_id,),
+            )
+            connection.executemany(
+                """INSERT INTO community_entities(community_id, entity_id)
+                   VALUES (?, ?)""",
+                [(community_id, entity_id) for entity_id in member_ids],
+            )
+
     async def _build_communities(self, kb_id: str, failed_chunks: int) -> None:
-        # A paused community/embedding stage is replayed from the completed entity graph.
-        # Clearing here makes that replay idempotent and avoids duplicate communities.
-        self.db.clear_communities(kb_id)
         entities = self.db.fetch_all(
             "SELECT id, name, entity_type, description FROM entities WHERE kb_id = ?", (kb_id,)
         )
@@ -313,6 +787,7 @@ class GraphRAGService:
             (kb_id,),
         )
         if not entities:
+            self.db.clear_communities(kb_id)
             self.db.update_graph_progress(
                 kb_id,
                 stage="communities",
@@ -323,16 +798,12 @@ class GraphRAGService:
             return
         communities = self._detect_communities([entity["id"] for entity in entities], relations)
         communities = communities[:100]
-        self.db.update_graph_progress(
-            kb_id,
-            stage="communities",
-            current=0,
-            total=len(communities),
-            failed_chunks=failed_chunks,
-        )
         entity_map = {entity["id"]: entity for entity in entities}
-        jobs: list[tuple[list[str], list[dict[str, Any]], list[dict[str, Any]]]] = []
+        jobs: list[
+            tuple[str, list[str], list[dict[str, Any]], list[dict[str, Any]]]
+        ] = []
         for member_ids in communities:
+            member_ids = sorted(member_ids)
             members = [entity_map[entity_id] for entity_id in member_ids]
             member_set = set(member_ids)
             internal_relations = [
@@ -340,34 +811,85 @@ class GraphRAGService:
                 for relation in relations
                 if relation["source_id"] in member_set and relation["target_id"] in member_set
             ]
-            jobs.append((member_ids, members, internal_relations))
+            jobs.append(
+                (
+                    self._community_id(kb_id, members, internal_relations),
+                    member_ids,
+                    members,
+                    internal_relations,
+                )
+            )
 
-        summaries: list[tuple[list[str], str, str]] = []
+        valid_ids = [community_id for community_id, *_ in jobs]
+        with self.db.connection() as connection:
+            if valid_ids:
+                placeholders = ",".join("?" for _ in valid_ids)
+                connection.execute(
+                    f"""DELETE FROM communities
+                        WHERE kb_id = ? AND id NOT IN ({placeholders})""",
+                    [kb_id, *valid_ids],
+                )
+            else:
+                connection.execute(
+                    "DELETE FROM communities WHERE kb_id = ?",
+                    (kb_id,),
+                )
+        existing_ids = {
+            str(row["id"])
+            for row in self.db.fetch_all(
+                """SELECT id FROM communities
+                   WHERE kb_id = ? AND length(summary) > 0""",
+                (kb_id,),
+            )
+        }
+        self.db.update_graph_progress(
+            kb_id,
+            stage="communities",
+            current=len(existing_ids),
+            total=len(jobs),
+            failed_chunks=failed_chunks,
+        )
         semaphore = asyncio.Semaphore(max(1, self.settings.graph_concurrency))
 
         async def summarize_job(
+            community_id: str,
             member_ids: list[str],
             members: list[dict[str, Any]],
             internal_relations: list[dict[str, Any]],
-        ) -> tuple[list[str], str, str]:
+        ) -> tuple[str, list[str], str, str]:
             async with semaphore:
                 title, summary = await self._summarize_community(members, internal_relations)
-            return member_ids, title, summary
+            return community_id, member_ids, title, summary
 
         summary_tasks = [
-            asyncio.create_task(summarize_job(member_ids, members, internal_relations))
-            for member_ids, members, internal_relations in jobs
+            asyncio.create_task(
+                summarize_job(
+                    community_id,
+                    member_ids,
+                    members,
+                    internal_relations,
+                )
+            )
+            for community_id, member_ids, members, internal_relations in jobs
+            if community_id not in existing_ids
         ]
-        completed_summaries = 0
+        completed_summaries = len(existing_ids)
         try:
             for completed_task in asyncio.as_completed(summary_tasks):
-                summaries.append(await completed_task)
+                community_id, member_ids, title, summary = await completed_task
+                self._store_community_summary(
+                    kb_id,
+                    community_id,
+                    member_ids,
+                    title,
+                    summary,
+                )
                 completed_summaries += 1
                 self.db.update_graph_progress(
                     kb_id,
                     stage="communities",
                     current=completed_summaries,
-                    total=len(communities),
+                    total=len(jobs),
                     failed_chunks=failed_chunks,
                 )
         finally:
@@ -377,45 +899,107 @@ class GraphRAGService:
             if summary_tasks:
                 await asyncio.gather(*summary_tasks, return_exceptions=True)
 
+        pending_embeddings = self.db.fetch_all(
+            """SELECT id, title, summary FROM communities
+               WHERE kb_id = ? AND embedding_dim = 0
+               ORDER BY id""",
+            (kb_id,),
+        )
+        embedded_count = len(jobs) - len(pending_embeddings)
         self.db.update_graph_progress(
             kb_id,
             stage="embedding",
-            current=0,
-            total=len(summaries),
+            current=embedded_count,
+            total=len(jobs),
             failed_chunks=failed_chunks,
         )
-        embeddings = await self.ai.embed_batched([f"{title}\n{summary}" for _, title, summary in summaries])
-        with self.db.connection() as connection:
-            for (member_ids, title, summary), embedding in zip(
-                summaries, embeddings, strict=True
-            ):
-                community_id = new_id()
-                connection.execute(
-                    """INSERT INTO communities
-                       (id, kb_id, title, summary, member_count, embedding, embedding_dim, created_at)
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
-                    (
-                        community_id,
-                        kb_id,
-                        title,
-                        summary,
-                        len(member_ids),
-                        vector_to_blob(embedding),
-                        len(embedding),
-                        utc_now(),
-                    ),
-                )
+        if pending_embeddings:
+            embeddings = await self.ai.embed_batched(
+                [
+                    f"{community['title']}\n{community['summary']}"
+                    for community in pending_embeddings
+                ]
+            )
+            with self.db.connection() as connection:
                 connection.executemany(
-                    "INSERT INTO community_entities(community_id, entity_id) VALUES (?, ?)",
-                    [(community_id, entity_id) for entity_id in member_ids],
+                    """UPDATE communities
+                       SET embedding = ?, embedding_dim = ?
+                       WHERE id = ? AND kb_id = ?""",
+                    [
+                        (
+                            vector_to_blob(embedding),
+                            len(embedding),
+                            community["id"],
+                            kb_id,
+                        )
+                        for community, embedding in zip(
+                            pending_embeddings,
+                            embeddings,
+                            strict=True,
+                        )
+                    ],
                 )
         self.db.update_graph_progress(
             kb_id,
             stage="embedding",
-            current=len(summaries),
-            total=len(summaries),
+            current=len(jobs),
+            total=len(jobs),
             failed_chunks=failed_chunks,
         )
+
+    async def _finalize_graph(self, kb_id: str, failed_chunks: int) -> None:
+        if self.settings.graph_llm_entity_matching:
+            await self._resolve_entity_aliases_with_llm(kb_id)
+        await self._build_communities(kb_id, failed_chunks)
+
+    async def finalize_partial(self, kb_id: str) -> bool:
+        """Build communities from an already sufficient persisted checkpoint."""
+        stats = self.db.graph_checkpoint_stats(kb_id)
+        unresolved = max(0, stats["total"] - stats["succeeded"])
+        success_ratio = (
+            stats["succeeded"] / stats["total"] * 100
+            if stats["total"]
+            else 0.0
+        )
+        if (
+            not stats["total"]
+            or not stats["succeeded"]
+            or success_ratio < self.settings.graph_success_threshold
+        ):
+            return False
+        self.db.update_graph_progress(
+            kb_id,
+            stage=(
+                "matching"
+                if self.settings.graph_llm_entity_matching
+                else "communities"
+            ),
+            current=stats["succeeded"],
+            total=stats["total"],
+            failed_chunks=unresolved,
+        )
+        try:
+            await asyncio.wait_for(
+                self._finalize_graph(kb_id, unresolved),
+                timeout=self.settings.graph_build_timeout,
+            )
+            self.db.complete_graph_build(kb_id, unresolved)
+            if not unresolved:
+                self.db.clear_graph_checkpoints(kb_id)
+            return True
+        except asyncio.CancelledError:
+            raise
+        except TimeoutError:
+            self.db.pause_graph_build(
+                kb_id,
+                "图社区生成达到总任务时限，已保留实体关系和文本块检查点，可继续构建",
+            )
+        except Exception as exc:
+            self.db.pause_graph_build(
+                kb_id,
+                f"图社区生成暂未完成，实体关系和检查点已保留：{str(exc)[:500]}",
+            )
+        return False
 
     @staticmethod
     def _is_retryable_extraction_error(error: BaseException) -> bool:
@@ -423,7 +1007,7 @@ class GraphRAGService:
             return error.retryable
         return isinstance(error, (TimeoutError, ValueError, ConnectionError))
 
-    async def _rebuild_pipeline(self, kb_id: str, chunks: list[dict[str, Any]]) -> bool:
+    async def _rebuild_pipeline(self, kb_id: str, chunks: list[dict[str, Any]]) -> int | None:
         stats = self.db.graph_checkpoint_stats(kb_id)
         last_error: BaseException | None = None
         fatal_error: BaseException | None = None
@@ -576,6 +1160,17 @@ class GraphRAGService:
         stats = self.db.graph_checkpoint_stats(kb_id)
         unresolved = max(0, stats["total"] - stats["succeeded"])
         if unresolved:
+            success_ratio = (
+                stats["succeeded"] / stats["total"] * 100
+                if stats["total"]
+                else 0.0
+            )
+            if (
+                stats["succeeded"] > 0
+                and success_ratio >= self.settings.graph_success_threshold
+            ):
+                await self._finalize_graph(kb_id, unresolved)
+                return unresolved
             self.db.update_graph_progress(
                 kb_id,
                 stage="retrying" if fatal_error is None else "extracting",
@@ -592,9 +1187,9 @@ class GraphRAGService:
                 "任务已暂停，继续构建只会重试未完成块"
             )
             self.db.pause_graph_build(kb_id, reason)
-            return False
-        await self._build_communities(kb_id, 0)
-        return True
+            return None
+        await self._finalize_graph(kb_id, 0)
+        return 0
 
     async def rebuild(self, kb_id: str, *, resume: bool = False) -> None:
         if resume:
@@ -617,14 +1212,15 @@ class GraphRAGService:
             self.db.prepare_graph_checkpoints(kb_id, [chunk["id"] for chunk in chunks])
             self.db.start_graph_build(kb_id, len(chunks))
         try:
-            completed = await asyncio.wait_for(
+            failed_chunks = await asyncio.wait_for(
                 self._rebuild_pipeline(kb_id, chunks),
                 timeout=self.settings.graph_build_timeout,
             )
-            if not completed:
+            if failed_chunks is None:
                 return
-            self.db.set_graph_status(kb_id, "ready")
-            self.db.clear_graph_checkpoints(kb_id)
+            self.db.complete_graph_build(kb_id, failed_chunks)
+            if not failed_chunks:
+                self.db.clear_graph_checkpoints(kb_id)
         except asyncio.CancelledError:
             raise
         except TimeoutError:

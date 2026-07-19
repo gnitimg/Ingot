@@ -65,6 +65,8 @@ class Settings(BaseSettings):
     graph_build_timeout: float = Field(default=3600.0, ge=60.0, le=86400.0)
     graph_retry_rounds: int = Field(default=2, ge=0, le=5)
     graph_retry_backoff: float = Field(default=2.0, ge=0.1, le=60.0)
+    graph_success_threshold: float = Field(default=90.0, ge=1.0, le=100.0)
+    graph_llm_entity_matching: bool = False
 
     @property
     def database_path(self) -> Path:

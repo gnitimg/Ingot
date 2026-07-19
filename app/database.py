@@ -400,6 +400,36 @@ class Database:
             (max(0, total), now, now, now, kb_id),
         )
 
+    def complete_graph_build(self, kb_id: str, failed_chunks: int) -> None:
+        now = utc_now()
+        stats = self.graph_checkpoint_stats(kb_id)
+        unresolved = max(0, int(failed_chunks))
+        status = "partial" if unresolved else "ready"
+        error = (
+            f"图谱已基于 {stats['succeeded']}/{stats['total']} 个成功文本块构建；"
+            f"仍有 {unresolved} 个失败块，可继续补全"
+            if unresolved
+            else None
+        )
+        self.execute(
+            """UPDATE knowledge_bases
+               SET graph_status = ?, graph_error = ?, graph_stage = 'completed',
+                   graph_progress_current = ?, graph_progress_total = ?,
+                   graph_failed_chunks = ?, graph_started_at = NULL,
+                   graph_heartbeat_at = ?, updated_at = ?
+               WHERE id = ?""",
+            (
+                status,
+                error,
+                stats["succeeded"] if stats["total"] else 0,
+                stats["total"],
+                unresolved,
+                now,
+                now,
+                kb_id,
+            ),
+        )
+
     def prepare_graph_checkpoints(self, kb_id: str, chunk_ids: Sequence[str]) -> None:
         now = utc_now()
         with self.connection() as connection:

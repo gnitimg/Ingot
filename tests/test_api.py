@@ -118,6 +118,35 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
             time.sleep(0.01)
         assert resumed_state["graph_status"] == "ready"
 
+        async def partial_graph_search(target_id, query, mode, top_k):
+            assert (target_id, query, mode, top_k) == (
+                kb_id,
+                "test",
+                "graph_global",
+                6,
+            )
+            return {
+                "chunks": [],
+                "facts": [],
+                "communities": [],
+                "rerank_used": False,
+                "warnings": [],
+            }
+
+        monkeypatch.setattr(main.retrieval, "search", partial_graph_search)
+        main.db.execute(
+            """UPDATE knowledge_bases
+               SET graph_status = 'partial', graph_failed_chunks = 1
+               WHERE id = ?""",
+            (kb_id,),
+        )
+        partial_search = client.post(
+            f"/api/knowledge-bases/{kb_id}/search",
+            headers=auth_headers,
+            json={"query": "test", "mode": "graph_global", "top_k": 6},
+        )
+        assert partial_search.status_code == 200
+
         changed_password = client.put(
             f"/api/knowledge-bases/{kb_id}/password",
             headers=auth_headers,
@@ -187,6 +216,8 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
         assert updated.status_code == 200
         assert updated.json()["embedding_model"] == "BAAI/bge-m3-test"
         assert updated.json()["graph_concurrency"] == 1000
+        assert updated.json()["graph_success_threshold"] == 90
+        assert updated.json()["graph_llm_entity_matching"] is False
         assert updated.json()["qa_evidence_count"] == current["qa_evidence_count"]
         assert "test-secret-key" not in updated.text
         assert "EMBEDDING_API_KEY=test-secret-key" in (tmp_path / ".env").read_text(encoding="utf-8")
@@ -194,9 +225,15 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
         assert "QA_EVIDENCE_COUNT=" in (tmp_path / ".env").read_text(encoding="utf-8")
 
         payload["embedding"]["api_key"] = ""
+        payload["graph"]["success_threshold"] = 92.5
+        payload["graph"]["llm_entity_matching"] = True
         retained = client.put("/api/settings", json=payload)
         assert retained.status_code == 200
+        assert retained.json()["graph_success_threshold"] == 92.5
+        assert retained.json()["graph_llm_entity_matching"] is True
         assert "EMBEDDING_API_KEY=test-secret-key" in (tmp_path / ".env").read_text(encoding="utf-8")
+        assert "GRAPH_SUCCESS_THRESHOLD=92.5" in (tmp_path / ".env").read_text(encoding="utf-8")
+        assert "GRAPH_LLM_ENTITY_MATCHING=true" in (tmp_path / ".env").read_text(encoding="utf-8")
 
         payload["graph"]["concurrency"] = 1001
         rejected_concurrency = client.put("/api/settings", json=payload)
