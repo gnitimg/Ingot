@@ -1,6 +1,6 @@
 # Ingot
 
-![Version](https://img.shields.io/badge/Version-1.0-blue)![License](https://img.shields.io/badge/License-MIT-green)![Language](https://img.shields.io/badge/Language-中文-red)![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white)![Vue](https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white)![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white)
+![Version](https://img.shields.io/badge/Version-1.1-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white) ![Vue](https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white) ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white) [![Switch](https://img.shields.io/badge/Switch-EN-yellow)](README_EN.md)
 
 > 本地优先的 RAG + OCR + GraphRAG 知识库应用 —— 把散落的文档锻造成可追溯的知识网络。
 
@@ -18,6 +18,7 @@ Ingot 是一个可直接在本机运行的全栈知识库应用，提供多知�
 | **四种检索模式** | 向量、图谱局部、图谱全局、混合 |
 | **流式问答** | SSE 流式生成答案，展示使用的原文、关系和图社区证据 |
 | **可视化图谱** | 浏览器中交互查看实体关系力导向图与社区摘要 |
+| **多格式导出** | 支持全量快照、摘要、原文、文档、文本块、向量、实体、关系、图谱、社区、检查点等 11 种数据类型，可选 Markdown / JSON / CSV / HTML / GraphML / PNG 格式导出，多选可打包为 ZIP |
 | **一键配置** | 交互式初始化向导，自动写入 `.env`，支持已有配置热更新 |
 
 ## 快速开始
@@ -324,7 +325,8 @@ app/
 │   ├── chunker.py          # 句子边界感知文本切分
 │   ├── ingestion.py        # 上传、解析、切分、向量化完整管线
 │   ├── graph_rag.py        # 实体关系抽取、社区发现、摘要构建
-│   └── retrieval.py        # 四种检索模式 + Reranker + 证据组装
+│   ├── retrieval.py        # 四种检索模式 + Reranker + 证据组装
+│   └── exporter.py         # 多格式数据导出（快照/摘要/图谱/社区等）
 └── static/                 # Vite 生产构建输出
 
 frontend/
@@ -347,6 +349,8 @@ tests/
 ├── test_graph_rag.py       # JSON 解析、实体归一化、社区发现
 ├── test_ocr.py             # 图片 OCR 预处理、元数据保留、未配置回退
 ├── test_ai_client.py       # Reranker 响应解析、无效索引过滤
+├── test_retrieval.py       # 检索模式、Reranker 集成、证据组装
+├── test_exporter.py        # 多格式导出、ZIP 打包、格式验证
 └── test_init.py            # .env 解析、配置检查
 
 init.py                     # 交互式配置向导
@@ -510,6 +514,13 @@ git check-ignore .env
 | `POST` | `/api/knowledge-bases/{id}/graph/cancel` | 停止构建并清空部分图谱与检查点（返回 202） |
 | `GET` | `/api/knowledge-bases/{id}/graph` | 获取实体、关系和社区（`?limit=500`） |
 
+### 数据导出
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| `GET` | `/api/knowledge-bases/{id}/exports/options` | 列出当前知识库可导出的数据类型和可用格式 |
+| `POST` | `/api/knowledge-bases/{id}/exports` | 按选择导出数据，返回文件下载（支持 `bundle: true` 打包 ZIP） |
+
 ### 系统
 
 | 方法 | 路径 | 说明 |
@@ -539,6 +550,8 @@ cd frontend && npm run typecheck && npm run build
 | `test_graph_rag.py` | Markdown 围栏 JSON 解析、实体归一化、社区发现、进度完成、单块超时与总超时检查点恢复 |
 | `test_ocr.py` | 图片 OCR 预处理（EXIF + PNG）、元数据保留、未配置回退 |
 | `test_ai_client.py` | Reranker 响应解析、无效索引过滤 |
+| `test_retrieval.py` | 检索模式执行、Reranker 集成、证据组装与模式降级 |
+| `test_exporter.py` | 多格式导出（Markdown/JSON/CSV/HTML/GraphML/PNG）、ZIP 打包、格式验证 |
 | `test_init.py` | `.env` 原子更新、配置检查、旧数据库迁移与端口预检 |
 
 ## 成本控制建议
