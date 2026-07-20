@@ -169,7 +169,49 @@ export interface Community {
 
 export interface GraphNode { id: string; name: string; type: string; description: string; mentions: number; }
 export interface GraphEdge { id: string; source: string; target: string; label: string; description: string; weight: number; }
-export interface GraphData { status: GraphStatus; error?: string; nodes: GraphNode[]; edges: GraphEdge[]; communities: Community[]; }
+export interface GraphData {
+  status: GraphStatus;
+  error?: string;
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  communities: Community[];
+  total_nodes: number;
+  total_edges: number;
+  total_communities: number;
+  is_truncated: boolean;
+}
+
+export type ExportKind =
+  | "snapshot"
+  | "summary"
+  | "originals"
+  | "documents"
+  | "chunks"
+  | "vectors"
+  | "entities"
+  | "relationships"
+  | "graph"
+  | "communities"
+  | "checkpoints";
+
+export interface ExportFormatOption {
+  value: string;
+  label: string;
+}
+
+export interface ExportOption {
+  kind: ExportKind;
+  label: string;
+  description: string;
+  formats: ExportFormatOption[];
+  count: number;
+  available: boolean;
+}
+
+export interface ExportSelection {
+  kind: ExportKind;
+  format: string;
+}
 
 export interface ChatTurn { role: "user" | "assistant"; content: string; }
 export interface EvidenceMeta {

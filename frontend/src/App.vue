@@ -5,13 +5,14 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue"
 import { api } from "./api";
 import GraphCanvas from "./components/GraphCanvas.vue";
 import type {
-  ChatTurn, DocumentItem, EvidenceMeta, GraphData, GraphStatus, KnowledgeBase,
+  ChatTurn, DocumentItem, EvidenceMeta, ExportOption, ExportSelection, GraphData, GraphStatus, KnowledgeBase,
   PublicSettings, RetrievalMode, SettingsUpdate,
 } from "./types";
 
-type TabName = "home" | "documents" | "chat" | "graph" | "settings";
+type TabName = "home" | "documents" | "chat" | "graph" | "export" | "settings";
 type RuntimeSettingsSection = keyof SettingsUpdate;
 type SettingsSection = RuntimeSettingsSection | "security";
+type GraphCanvasHandle = { resetLayout: () => void };
 interface ToastItem { id: number; message: string; type: "success" | "error"; }
 interface UploadResult { documents: Array<{ status: string; error?: string }>; }
 interface UnlockResponse { access_token: string; knowledge_base: KnowledgeBase; }
@@ -48,8 +49,13 @@ const uploading = ref(false);
 const graph = ref<GraphData | null>(null);
 const graphSearch = ref("");
 const graphPanel = ref<HTMLElement | null>(null);
+const graphCanvas = ref<GraphCanvasHandle | null>(null);
 const graphFullscreen = ref(false);
 const graphFullscreenFallback = ref(false);
+const exportOptions = ref<ExportOption[]>([]);
+const exportSelections = ref<Record<string, boolean>>({});
+const exportFormats = ref<Record<string, string>>({});
+const exporting = ref(false);
 const retrievalMode = ref<RetrievalMode>("hybrid");
 const chatTurns = ref<ChatTurn[]>([]);
 const chatInput = ref("");
@@ -102,7 +108,8 @@ const tabs: Array<{ key: TabName; label: string; index: string }> = [
   { key: "documents", label: "文档", index: "02" },
   { key: "chat", label: "问答", index: "03" },
   { key: "graph", label: "知识图谱", index: "04" },
-  { key: "settings", label: "配置", index: "05" },
+  { key: "export", label: "导出", index: "05" },
+  { key: "settings", label: "配置", index: "06" },
 ];
 const settingsSectionLabels: Record<RuntimeSettingsSection, string> = {
   embedding: "Embedding",
@@ -141,6 +148,13 @@ const graphUnfinishedCount = computed(() => {
   return Math.max(0, total - succeeded);
 });
 const landingDocumentCount = computed(() => knowledgeBases.value.reduce((total, kb) => total + kb.document_count, 0));
+const selectedExportCount = computed(() => (
+  exportOptions.value.filter(option => option.available && exportSelections.value[option.kind]).length
+));
+const allExportsSelected = computed(() => (
+  exportOptions.value.some(option => option.available)
+  && exportOptions.value.filter(option => option.available).every(option => exportSelections.value[option.kind])
+));
 
 function isGraphResumable(kb: KnowledgeBase | null) {
   if (!kb) return false;
@@ -248,6 +262,9 @@ async function requestKnowledgeBaseUnlock(kbId: string) {
     current.value = null;
     documents.value = [];
     graph.value = null;
+    exportOptions.value = [];
+    exportSelections.value = {};
+    exportFormats.value = {};
     evidence.value = null;
     chatTurns.value = [];
     showLanding.value = true;
@@ -497,6 +514,9 @@ async function selectKnowledgeBase(id: string, resetTab = true) {
   securityForm.value = { old_password: "", new_password: "", confirm_password: "" };
   showLanding.value = false;
   graph.value = null;
+  exportOptions.value = [];
+  exportSelections.value = {};
+  exportFormats.value = {};
   chatTurns.value = [];
   evidence.value = null;
   if (resetTab) activeTab.value = "home";
@@ -983,13 +1003,127 @@ function handleGraphFullscreenKeydown(event: KeyboardEvent) {
 }
 
 async function loadGraph() {
+  if (!current.value) return false;
+  const kbId = current.value.id;
+  try {
+    graph.value = await kbApi<GraphData>(kbId, `/api/knowledge-bases/${kbId}/graph?limit=300`);
+    return true;
+  }
+  catch (error) {
+    if (await handleKnowledgeBaseAccessError(kbId, error)) return false;
+    notify((error as Error).message, "error");
+    return false;
+  }
+}
+
+async function refreshGraph() {
+  if (!await loadGraph()) return;
+  await nextTick();
+  graphCanvas.value?.resetLayout();
+  notify("图谱数据已刷新，节点布局已重置");
+}
+
+async function loadExportOptions() {
   if (!current.value) return;
   const kbId = current.value.id;
-  try { graph.value = await kbApi<GraphData>(kbId, `/api/knowledge-bases/${kbId}/graph?limit=300`); }
-  catch (error) {
+  try {
+    const options = await kbApi<ExportOption[]>(
+      kbId,
+      `/api/knowledge-bases/${kbId}/exports/options`,
+    );
+    if (current.value?.id !== kbId) return;
+    exportOptions.value = options;
+    const formats = { ...exportFormats.value };
+    const selections = { ...exportSelections.value };
+    for (const option of options) {
+      const allowed = new Set(option.formats.map(format => format.value));
+      if (!allowed.has(formats[option.kind] || "")) {
+        formats[option.kind] = option.formats.find(format => format.value === "md")?.value
+          || option.formats[0]?.value
+          || "";
+      }
+      if (!(option.kind in selections)) selections[option.kind] = false;
+    }
+    exportFormats.value = formats;
+    exportSelections.value = selections;
+  } catch (error) {
     if (await handleKnowledgeBaseAccessError(kbId, error)) return;
     notify((error as Error).message, "error");
   }
+}
+
+function setAllExportSelections(value: boolean) {
+  exportSelections.value = Object.fromEntries(
+    exportOptions.value.map(option => [option.kind, value && option.available]),
+  );
+}
+
+function exportFilename(response: Response, fallback: string) {
+  const disposition = response.headers.get("Content-Disposition") || "";
+  const utf8Match = disposition.match(/filename\*=UTF-8''([^;]+)/i);
+  if (utf8Match) {
+    try { return decodeURIComponent(utf8Match[1]!); }
+    catch { /* use the ASCII fallback */ }
+  }
+  const quotedMatch = disposition.match(/filename="([^"]+)"/i);
+  return quotedMatch?.[1] || fallback;
+}
+
+async function performExport(selections: ExportSelection[], bundle: boolean) {
+  if (!current.value || exporting.value || !selections.length) return;
+  const kbId = current.value.id;
+  exporting.value = true;
+  try {
+    const response = await fetch(`/api/knowledge-bases/${kbId}/exports`, kbRequestOptions(kbId, {
+      method: "POST",
+      cache: "no-store",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ selections, bundle }),
+    }));
+    if (!response.ok) {
+      let detail = `导出失败（${response.status}）`;
+      try {
+        const payload = await response.json() as { detail?: string };
+        if (payload.detail) detail = payload.detail;
+      } catch { /* response is not JSON */ }
+      throw new Error(detail);
+    }
+    const blob = await response.blob();
+    const objectUrl = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = objectUrl;
+    link.download = exportFilename(response, `${current.value?.name || "knowledge-base"}-export${bundle ? ".zip" : ""}`);
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    window.setTimeout(() => URL.revokeObjectURL(objectUrl), 1000);
+    notify(bundle ? `已打包下载 ${selections.length} 项数据` : "导出文件已下载");
+  } catch (error) {
+    if (await handleKnowledgeBaseAccessError(kbId, error)) return;
+    notify((error as Error).message, "error");
+  } finally {
+    exporting.value = false;
+  }
+}
+
+function downloadSingleExport(option: ExportOption) {
+  const format = exportFormats.value[option.kind];
+  if (!option.available || !format) return;
+  void performExport([{ kind: option.kind, format }], false);
+}
+
+function downloadSelectedExports() {
+  const selections: ExportSelection[] = exportOptions.value
+    .filter(option => option.available && exportSelections.value[option.kind])
+    .flatMap(option => {
+      const format = exportFormats.value[option.kind];
+      return format ? [{ kind: option.kind, format }] : [];
+    });
+  if (!selections.length) {
+    notify("请至少勾选一项导出内容", "error");
+    return;
+  }
+  void performExport(selections, true);
 }
 
 async function scrollMessages() {
@@ -1065,6 +1199,7 @@ async function sendChat() {
 watch(activeTab, tab => {
   if (tab !== "settings" && editingSettingsSection.value) discardSettingsSection(editingSettingsSection.value);
   if (tab === "graph") void loadGraph();
+  if (tab === "export") void loadExportOptions();
 });
 onMounted(async () => {
   document.addEventListener("pointerdown", handleSettingsPointerDown, true);
@@ -1142,9 +1277,9 @@ onBeforeUnmount(() => {
           <div class="home-stats" aria-label="知识库统计">
             <article><span>DOCUMENTS</span><strong>{{ current.document_count }}</strong><small>份文档</small></article>
             <article><span>CHUNKS</span><strong>{{ current.chunk_count }}</strong><small>个文本块</small></article>
-            <article><span>ENTITIES</span><strong>{{ current.entity_count }}</strong><small>个实体</small></article>
-            <article><span>RELATIONS</span><strong>{{ current.relationship_count }}</strong><small>条关系</small></article>
-            <article><span>COMMUNITIES</span><strong>{{ current.community_count || 0 }}</strong><small>个图社区</small></article>
+            <article title="数据库中已入库的全量实体"><span>ENTITIES · TOTAL</span><strong>{{ current.entity_count }}</strong><small>个全量实体</small></article>
+            <article title="数据库中已入库的全量关系"><span>RELATIONS · TOTAL</span><strong>{{ current.relationship_count }}</strong><small>条全量关系</small></article>
+            <article title="数据库中已生成的全量图社区"><span>COMMUNITIES · TOTAL</span><strong>{{ current.community_count || 0 }}</strong><small>个全量图社区</small></article>
           </div>
 
           <div class="home-guidance">
@@ -1162,12 +1297,15 @@ onBeforeUnmount(() => {
               <button class="guidance-card" @click="activeTab = 'settings'">
                 <span>04 / CONFIGURE</span><strong>检查模型与吞吐配置</strong><p>在浏览器中调整模型地址、密钥、OCR、Reranker、切分参数和 GraphRAG 抽取并发。</p><b>打开配置 →</b>
               </button>
+              <button class="guidance-card" @click="activeTab = 'export'">
+                <span>05 / EXPORT</span><strong>导出数据</strong><p>将构建好的知识图谱或相关数据导出为标准格式，由你定。</p><b>导出数据 →</b>
+              </button>
             </div>
           </div>
         </section>
 
         <section v-show="activeTab === 'documents'" id="panel-documents" class="tab-panel" :class="{ active: activeTab === 'documents' }">
-          <div class="section-heading"><div><p class="eyebrow">INGESTION PIPELINE</p><h2>构建知识底座</h2><p>原生文本优先；图片和低文本密度 PDF 页面自动进入 OCR，再执行切分、向量化与索引。</p></div><div class="graph-build-actions"><button v-if="current.graph_status === 'building' || (isGraphResumable(current) && current.graph_status !== 'partial')" class="button button-ghost button-stop" @click="stopGraph"><span class="button-icon">■</span>停止构建</button><button class="button button-secondary" :disabled="!current.chunk_count || current.graph_status === 'building'" @click="isGraphResumable(current) ? resumeGraph() : buildGraph()"><span class="button-icon">{{ isGraphResumable(current) ? "↻" : "⌘" }}</span>{{ current.graph_status === "building" ? "正在构建…" : current.graph_status === "partial" ? "继续补全" : isGraphResumable(current) ? "继续构建" : "构建 GraphRAG" }}</button></div></div>
+          <div class="section-heading"><div><p class="eyebrow">INGESTION PIPELINE</p><h2>构建知识底座</h2></div><div class="graph-build-actions"><button v-if="current.graph_status === 'building' || (isGraphResumable(current) && current.graph_status !== 'partial')" class="button button-ghost button-stop" @click="stopGraph"><span class="button-icon">■</span>停止构建</button><button class="button button-secondary" :disabled="!current.chunk_count || current.graph_status === 'building'" @click="isGraphResumable(current) ? resumeGraph() : buildGraph()"><span class="button-icon">{{ isGraphResumable(current) ? "↻" : "⌘" }}</span>{{ current.graph_status === "building" ? "正在构建…" : current.graph_status === "partial" ? "继续补全" : isGraphResumable(current) ? "继续构建" : "构建 GraphRAG" }}</button></div></div>
           <div class="pipeline-strip"><span><i>01</i> 文档解析</span><b>→</b><span><i>02</i> OCR fallback</span><b>→</b><span><i>03</i> Chunk + Embed</span><b>→</b><span><i>04</i> Rerank / Graph</span></div>
           <div v-if="current.graph_status === 'partial'" class="graph-build-alert graph-build-partial"><strong>图谱已部分就绪</strong><span>{{ current.graph_error || "已达到自动建社区阈值，可正常浏览和问答；失败文本块仍保留在检查点中，可随时继续补全。" }}</span></div>
           <div v-else-if="isGraphResumable(current)" class="graph-build-alert graph-build-paused"><strong>图谱构建已暂停</strong><span>{{ current.graph_status === "paused" ? current.graph_error : "检测到旧版超时任务；点击继续后会保留现有实体关系，并仅重试尚未确认完成的文本块。" }}</span></div>
@@ -1211,10 +1349,18 @@ onBeforeUnmount(() => {
 
         <section ref="graphPanel" v-show="activeTab === 'graph'" id="panel-graph" class="tab-panel" :class="{ active: activeTab === 'graph', 'is-fullscreen': graphFullscreen, 'is-fullscreen-fallback': graphFullscreenFallback }">
           <div class="graph-toolbar">
-            <div><p class="eyebrow">ENTITY RELATIONSHIP MAP</p><h2>知识图谱</h2><p>{{ graph ? `${graph.nodes.length} 个实体 · ${graph.edges.length} 条关系 · ${graph.communities.length} 个图社区` : "尚未构建图谱" }}</p></div>
+            <div>
+              <p class="eyebrow">ENTITY RELATIONSHIP MAP</p>
+              <h2>知识图谱</h2>
+              <p v-if="graph">
+                全量 {{ graph.total_nodes }} 个实体 · {{ graph.total_edges }} 条关系 · {{ graph.total_communities }} 个图社区
+                <span v-if="graph.is_truncated" class="graph-render-count">当前视图显示 {{ graph.nodes.length }} 个实体 · {{ graph.edges.length }} 条关系 · {{ graph.communities.length }} 个图社区</span>
+              </p>
+              <p v-else>尚未构建图谱</p>
+            </div>
             <div class="graph-actions">
               <label class="search-box">⌕<input v-model="graphSearch" placeholder="查找实体"></label>
-              <button class="button button-secondary graph-refresh-button" @click="loadGraph">刷新</button>
+              <button class="button button-secondary graph-refresh-button" title="重新读取数据并恢复初始节点布局" @click="refreshGraph">刷新并重置</button>
               <button class="button button-ghost graph-fullscreen-button" type="button" :title="graphFullscreen ? '退出全屏（Esc）' : '全屏查看图谱'" @click="toggleGraphFullscreen">
                 <svg v-if="graphFullscreen" aria-hidden="true" viewBox="0 0 24 24"><path d="M3 8h5V3M21 8h-5V3M21 16h-5v5M3 16h5v5" /></svg>
                 <svg v-else aria-hidden="true" viewBox="0 0 24 24"><path d="M8 3H3v5M16 3h5v5M21 16v5h-5M8 21H3v-5" /></svg>
@@ -1222,7 +1368,47 @@ onBeforeUnmount(() => {
               </button>
             </div>
           </div>
-          <div class="graph-layout"><GraphCanvas :nodes="graph?.nodes || []" :edges="graph?.edges || []" :search="graphSearch" /><aside class="community-panel"><div class="evidence-head"><span>图社区</span><small>GLOBAL INDEX</small></div><div class="community-list"><div v-if="!graph?.communities.length" class="evidence-empty">构建完成后，这里会显示用于全局检索的主题社区。</div><article v-for="(community, index) in graph?.communities" :key="community.id" class="community-card"><span>COMMUNITY {{ String(index + 1).padStart(2, "0") }} · {{ community.member_count }} ENTITIES</span><strong>{{ community.title }}</strong><p>{{ community.summary }}</p></article></div></aside></div>
+          <div class="graph-layout"><GraphCanvas ref="graphCanvas" :nodes="graph?.nodes || []" :edges="graph?.edges || []" :search="graphSearch" /><aside class="community-panel"><div class="evidence-head"><span>图社区</span><small>GLOBAL INDEX</small></div><div class="community-list"><div v-if="!graph?.communities.length" class="evidence-empty">构建完成后，这里会显示用于全局检索的主题社区。</div><article v-for="(community, index) in graph?.communities" :key="community.id" class="community-card"><span>COMMUNITY {{ String(index + 1).padStart(2, "0") }} · {{ community.member_count }} ENTITIES</span><strong>{{ community.title }}</strong><p>{{ community.summary }}</p></article></div></aside></div>
+        </section>
+
+        <section v-show="activeTab === 'export'" id="panel-export" class="tab-panel" :class="{ active: activeTab === 'export' }">
+          <div class="section-heading export-heading">
+            <div>
+              <p class="eyebrow">PORTABLE KNOWLEDGE ASSETS</p>
+              <h2>数据导出</h2>
+              <p>按用途选择数据和文件格式；单项直接下载，批量导出统一打包为 ZIP。</p>
+            </div>
+            <div class="export-batch-actions">
+              <span>已选 {{ selectedExportCount }} 项</span>
+              <button type="button" class="button button-ghost" :disabled="!exportOptions.length" @click="setAllExportSelections(!allExportsSelected)">{{ allExportsSelected ? "清空选择" : "选择全部" }}</button>
+              <button type="button" class="button button-primary" :disabled="exporting || !selectedExportCount" @click="downloadSelectedExports">{{ exporting ? "正在生成…" : "打包下载 ZIP" }}</button>
+            </div>
+          </div>
+          <div v-if="!exportOptions.length" class="list-empty">正在读取可导出的数据…</div>
+          <div v-else class="export-grid">
+            <article v-for="(option, index) in exportOptions" :key="option.kind" class="export-card" :class="{ unavailable: !option.available, selected: exportSelections[option.kind] }">
+              <div class="export-card-head">
+                <label class="export-check">
+                  <input v-model="exportSelections[option.kind]" type="checkbox" :disabled="!option.available">
+                  <span>{{ String(index + 1).padStart(2, "0") }}</span>
+                </label>
+                <small>{{ option.count }} ITEMS</small>
+              </div>
+              <strong>{{ option.label }}</strong>
+              <p>{{ option.description }}</p>
+              <div class="export-card-footer">
+                <label>
+                  <span>文件格式</span>
+                  <select v-model="exportFormats[option.kind]" :disabled="!option.available || exporting">
+                    <option v-for="format in option.formats" :key="format.value" :value="format.value">{{ format.label }} (.{{ format.value }})</option>
+                  </select>
+                </label>
+                <button type="button" class="button button-secondary" :disabled="!option.available || exporting" @click="downloadSingleExport(option)">单独导出</button>
+              </div>
+              <div v-if="!option.available" class="export-unavailable">当前知识库暂无此类数据</div>
+            </article>
+          </div>
+          <p class="export-note">图谱 Markdown 内含 Mermaid；GraphML / GEXF 适合图分析工具，SVG / PNG 适合直接查看。向量推荐使用 NPZ，以保留精度并减小体积。</p>
         </section>
 
         <section v-show="activeTab === 'settings'" id="panel-settings" class="tab-panel" :class="{ active: activeTab === 'settings' }">

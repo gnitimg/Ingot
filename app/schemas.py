@@ -136,3 +136,39 @@ class ChatMessage(BaseModel):
 class ChatRequest(SearchRequest):
     history: list[ChatMessage] = Field(default_factory=list, max_length=20)
 
+
+ExportKind = Literal[
+    "snapshot",
+    "summary",
+    "originals",
+    "documents",
+    "chunks",
+    "vectors",
+    "entities",
+    "relationships",
+    "graph",
+    "communities",
+    "checkpoints",
+]
+
+
+class ExportSelection(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: ExportKind
+    format: str = Field(min_length=2, max_length=16, pattern=r"^[a-z0-9]+$")
+
+
+class ExportRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    selections: list[ExportSelection] = Field(min_length=1, max_length=12)
+    bundle: bool = False
+
+    @model_validator(mode="after")
+    def unique_export_kinds(self) -> "ExportRequest":
+        kinds = [selection.kind for selection in self.selections]
+        if len(kinds) != len(set(kinds)):
+            raise ValueError("同一种数据一次只能选择一种导出格式")
+        return self
+

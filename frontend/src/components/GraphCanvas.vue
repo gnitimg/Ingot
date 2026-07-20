@@ -26,6 +26,8 @@ interface SimNode extends GraphNode, SimulationNodeDatum {
 type SimEdge = Omit<GraphEdge, "source" | "target"> & SimulationLinkDatum<SimNode> & {
   source: string | SimNode;
   target: string | SimNode;
+  parallelIndex: number;
+  parallelCount: number;
 };
 
 type Interaction =
@@ -245,7 +247,7 @@ function updateImportantLabels() {
   );
 }
 
-function setData() {
+function setData(preserveExistingPositions = true) {
   if (!hasUsableSize()) {
     layoutPending = true;
     return;
@@ -258,7 +260,7 @@ function setData() {
     ? Math.max(...previousValues.map(node => node.x)) - Math.min(...previousValues.map(node => node.x))
       + Math.max(...previousValues.map(node => node.y)) - Math.min(...previousValues.map(node => node.y))
     : 0;
-  const preservePositions = previousSpread > 20;
+  const preservePositions = preserveExistingPositions && previousSpread > 20;
 
   simNodes.value = props.nodes.map((node, index) => {
     const previous = preservePositions ? previousNodes.get(node.id) : undefined;
@@ -278,7 +280,31 @@ function setData() {
   nodeMap = new Map(simNodes.value.map(node => [node.id, node]));
   simEdges.value = props.edges
     .filter(edge => nodeMap.has(edge.source) && nodeMap.has(edge.target))
-    .map(edge => ({ ...edge, source: edge.source, target: edge.target }));
+    .map(edge => ({
+      ...edge,
+      source: edge.source,
+      target: edge.target,
+      parallelIndex: 0,
+      parallelCount: 1,
+    }));
+  const parallelGroups = new Map<string, SimEdge[]>();
+  for (const edge of simEdges.value) {
+    const endpoints = [String(edge.source), String(edge.target)].sort();
+    const key = `${endpoints[0]}\u001f${endpoints[1]}`;
+    const group = parallelGroups.get(key) || [];
+    group.push(edge);
+    parallelGroups.set(key, group);
+  }
+  for (const group of parallelGroups.values()) {
+    group.sort((left, right) => (
+      String(left.label || "").localeCompare(String(right.label || ""))
+      || String(left.id).localeCompare(String(right.id))
+    ));
+    group.forEach((edge, index) => {
+      edge.parallelIndex = index;
+      edge.parallelCount = group.length;
+    });
+  }
   for (const edge of simEdges.value) {
     nodeMap.get(String(edge.source))!.degree++;
     nodeMap.get(String(edge.target))!.degree++;
@@ -326,6 +352,15 @@ function setData() {
   simulation.alpha(0.42).restart();
 }
 
+function resetLayout() {
+  selectedNodeId.value = null;
+  hoveredNodeId.value = null;
+  tooltip.value = null;
+  interaction = null;
+  userTransformed = false;
+  setData(false);
+}
+
 function selectedNeighborhood(): Set<string> {
   const ids = new Set<string>();
   const selected = selectedNodeId.value;
@@ -341,8 +376,74 @@ function selectedNeighborhood(): Set<string> {
   return ids;
 }
 
-function drawEdgeLabel(context: CanvasRenderingContext2D, edge: SimEdge, source: SimNode, target: SimNode) {
-  if (!edge.label) return;
+interface EdgeGeometry {
+  startX: number;
+  startY: number;
+  controlX: number;
+  controlY: number;
+  endX: number;
+  endY: number;
+  tangentX: number;
+  tangentY: number;
+  normalX: number;
+  normalY: number;
+  labelX: number;
+  labelY: number;
+}
+
+function edgeGeometry(edge: SimEdge, source: SimNode, target: SimNode): EdgeGeometry {
+  const centerDx = target.x - source.x;
+  const centerDy = target.y - source.y;
+  const centerDistance = Math.hypot(centerDx, centerDy) || 1;
+  const chordX = centerDx / centerDistance;
+  const chordY = centerDy / centerDistance;
+  const rank = edge.parallelIndex - (edge.parallelCount - 1) / 2;
+  const directionSign = source.id <= target.id ? 1 : -1;
+  const curveOffset = rank * (34 / zoom.value) * directionSign;
+  const normalX = -chordY;
+  const normalY = chordX;
+  const controlX = (source.x + target.x) / 2 + normalX * curveOffset;
+  const controlY = (source.y + target.y) / 2 + normalY * curveOffset;
+
+  const sourceDx = controlX - source.x;
+  const sourceDy = controlY - source.y;
+  const sourceDistance = Math.hypot(sourceDx, sourceDy) || 1;
+  const sourceUx = sourceDx / sourceDistance;
+  const sourceUy = sourceDy / sourceDistance;
+  const targetDx = target.x - controlX;
+  const targetDy = target.y - controlY;
+  const targetDistance = Math.hypot(targetDx, targetDy) || 1;
+  const tangentX = targetDx / targetDistance;
+  const tangentY = targetDy / targetDistance;
+  const sourceGap = nodeRadius(source) + 1 / zoom.value;
+  const targetGap = nodeRadius(target) + 0.8 / zoom.value;
+  const startX = source.x + sourceUx * sourceGap;
+  const startY = source.y + sourceUy * sourceGap;
+  const endX = target.x - tangentX * targetGap;
+  const endY = target.y - tangentY * targetGap;
+  return {
+    startX,
+    startY,
+    controlX,
+    controlY,
+    endX,
+    endY,
+    tangentX,
+    tangentY,
+    normalX,
+    normalY,
+    labelX: (startX + 2 * controlX + endX) / 4,
+    labelY: (startY + 2 * controlY + endY) / 4,
+  };
+}
+
+function drawEdgeLabel(
+  context: CanvasRenderingContext2D,
+  edge: SimEdge,
+  geometry: EdgeGeometry,
+  occupied: LabelBounds[],
+): LabelBounds | null {
+  if (!edge.label) return null;
   const fontSize = 9.5 / zoom.value;
   const label = edge.label.length > 18 ? `${edge.label.slice(0, 17)}…` : edge.label;
   context.save();
@@ -350,14 +451,42 @@ function drawEdgeLabel(context: CanvasRenderingContext2D, edge: SimEdge, source:
   const paddingX = 4 / zoom.value;
   const boxHeight = 16 / zoom.value;
   const boxWidth = context.measureText(label).width + paddingX * 2;
-  const x = (source.x + target.x) / 2 - boxWidth / 2;
-  const y = (source.y + target.y) / 2 - boxHeight / 2;
-  context.fillStyle = "rgba(248,247,241,.92)";
-  context.fillRect(x, y, boxWidth, boxHeight);
+  const gap = 3 / zoom.value;
+  let bounds: LabelBounds = {
+    x: geometry.labelX - boxWidth / 2,
+    y: geometry.labelY - boxHeight / 2,
+    width: boxWidth,
+    height: boxHeight,
+  };
+  for (const shift of [0, 18, -18, 36, -36]) {
+    const candidate = {
+      x: geometry.labelX + geometry.normalX * (shift / zoom.value) - boxWidth / 2,
+      y: geometry.labelY + geometry.normalY * (shift / zoom.value) - boxHeight / 2,
+      width: boxWidth,
+      height: boxHeight,
+    };
+    const overlaps = occupied.some(item => (
+      candidate.x < item.x + item.width + gap
+      && candidate.x + candidate.width + gap > item.x
+      && candidate.y < item.y + item.height + gap
+      && candidate.y + candidate.height + gap > item.y
+    ));
+    if (!overlaps) {
+      bounds = candidate;
+      break;
+    }
+  }
+  context.fillStyle = "rgba(248,247,241,.96)";
+  context.fillRect(bounds.x, bounds.y, boxWidth, boxHeight);
+  context.strokeStyle = "rgba(104,117,110,.28)";
+  context.lineWidth = 0.65 / zoom.value;
+  context.strokeRect(bounds.x, bounds.y, boxWidth, boxHeight);
   context.fillStyle = "#55615b";
   context.textBaseline = "middle";
-  context.fillText(label, x + paddingX, y + boxHeight / 2);
+  context.fillText(label, bounds.x + paddingX, bounds.y + boxHeight / 2);
   context.restore();
+  occupied.push(bounds);
+  return bounds;
 }
 
 interface LabelBounds { x: number; y: number; width: number; height: number }
@@ -415,6 +544,7 @@ function draw() {
   const neighborhood = selectedNeighborhood();
   const selected = selectedNodeId.value;
   const hovered = hoveredNodeId.value;
+  const visibleEdgeLabels: Array<{ edge: SimEdge; geometry: EdgeGeometry }> = [];
   for (const edge of simEdges.value) {
     const source = edgeNode(edge.source);
     const target = edgeNode(edge.target);
@@ -422,35 +552,44 @@ function draw() {
     const connected = Boolean(selected && (source.id === selected || target.id === selected));
     const hoverConnected = Boolean(hovered && (source.id === hovered || target.id === hovered));
     const dimmed = Boolean(selected && !connected);
-    const dx = target.x - source.x;
-    const dy = target.y - source.y;
-    const distance = Math.hypot(dx, dy) || 1;
-    const ux = dx / distance;
-    const uy = dy / distance;
-    const startX = source.x + ux * (nodeRadius(source) + 2);
-    const startY = source.y + uy * (nodeRadius(source) + 2);
-    const endX = target.x - ux * (nodeRadius(target) + 5);
-    const endY = target.y - uy * (nodeRadius(target) + 5);
+    const distance = Math.hypot(target.x - source.x, target.y - source.y) || 1;
+    const geometry = edgeGeometry(edge, source, target);
     context.save();
     context.globalAlpha = dimmed ? 0.07 : connected || hoverConnected ? 0.82 : 0.28;
     context.lineWidth = (connected || hoverConnected ? 1.45 : 0.85) / zoom.value;
     context.strokeStyle = connected ? "#395e4d" : "#68756e";
     context.beginPath();
-    context.moveTo(startX, startY);
-    context.lineTo(endX, endY);
+    context.moveTo(geometry.startX, geometry.startY);
+    context.quadraticCurveTo(
+      geometry.controlX,
+      geometry.controlY,
+      geometry.endX,
+      geometry.endY,
+    );
     context.stroke();
     if (!dimmed && distance > 34) {
       const arrowSize = (connected || hoverConnected ? 5.5 : 4) / zoom.value;
       context.fillStyle = connected ? "#395e4d" : "#68756e";
       context.beginPath();
-      context.moveTo(endX, endY);
-      context.lineTo(endX - ux * arrowSize - uy * arrowSize * 0.7, endY - uy * arrowSize + ux * arrowSize * 0.7);
-      context.lineTo(endX - ux * arrowSize + uy * arrowSize * 0.7, endY - uy * arrowSize - ux * arrowSize * 0.7);
+      context.moveTo(geometry.endX, geometry.endY);
+      context.lineTo(
+        geometry.endX - geometry.tangentX * arrowSize - geometry.tangentY * arrowSize * 0.72,
+        geometry.endY - geometry.tangentY * arrowSize + geometry.tangentX * arrowSize * 0.72,
+      );
+      context.lineTo(
+        geometry.endX - geometry.tangentX * arrowSize + geometry.tangentY * arrowSize * 0.72,
+        geometry.endY - geometry.tangentY * arrowSize - geometry.tangentX * arrowSize * 0.72,
+      );
       context.closePath();
       context.fill();
     }
     context.restore();
-    if (connected || hoverConnected) drawEdgeLabel(context, edge, source, target);
+    if (connected || hoverConnected) visibleEdgeLabels.push({ edge, geometry });
+  }
+
+  const occupiedEdgeLabels: LabelBounds[] = [];
+  for (const { edge, geometry } of visibleEdgeLabels) {
+    drawEdgeLabel(context, edge, geometry, occupiedEdgeLabels);
   }
 
   for (const node of simNodes.value) {
@@ -498,7 +637,7 @@ function draw() {
     if (aEmphasized !== bEmphasized) return aEmphasized ? 1 : -1;
     return (b.degree * 4 + Number(b.mentions || 0)) - (a.degree * 4 + Number(a.mentions || 0));
   });
-  const occupiedLabels: LabelBounds[] = [];
+  const occupiedLabels: LabelBounds[] = [...occupiedEdgeLabels];
   for (const node of labelNodes) {
     const emphasized = node.id === selected || node.id === hovered || Boolean(query && node.name.toLocaleLowerCase().includes(query));
     drawNodeLabel(context, node, emphasized, occupiedLabels);
@@ -627,6 +766,7 @@ watch(dataSignature, async () => {
   if (layoutPending) setData();
 });
 watch(() => props.search, draw);
+defineExpose({ resetLayout });
 onMounted(async () => {
   await nextTick();
   resizeObserver = new ResizeObserver(resize);

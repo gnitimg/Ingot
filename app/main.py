@@ -4,13 +4,15 @@ import asyncio
 import hashlib
 import hmac
 import json
+import re
 import secrets
 from contextlib import asynccontextmanager
 from ipaddress import ip_address
 from pathlib import Path
+from urllib.parse import quote
 
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
-from fastapi.responses import FileResponse, StreamingResponse
+from fastapi.responses import FileResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import SecretStr
 
@@ -18,6 +20,7 @@ from app.config import Settings, get_settings
 from app.database import Database
 from app.schemas import (
     ChatRequest,
+    ExportRequest,
     KnowledgeBaseCreate,
     KnowledgeBasePasswordUpdate,
     KnowledgeBaseUnlock,
@@ -25,6 +28,7 @@ from app.schemas import (
     SettingsUpdate,
 )
 from app.services.ai_client import AIClient, AIServiceError
+from app.services.exporter import KnowledgeBaseExporter
 from app.services.graph_rag import GraphRAGService
 from app.services.ingestion import IngestionService
 from app.services.retrieval import RetrievalService
@@ -37,6 +41,7 @@ ai = AIClient(settings)
 ingestion = IngestionService(db, ai, settings)
 graph_rag = GraphRAGService(db, ai, settings)
 retrieval = RetrievalService(db, ai, settings)
+exporter = KnowledgeBaseExporter(db)
 static_dir = Path(__file__).parent / "static"
 settings_update_lock = asyncio.Lock()
 graph_tasks: dict[str, asyncio.Task[None]] = {}
@@ -699,6 +704,51 @@ async def get_graph(kb_id: str, request: Request, limit: int = 500) -> dict:
     return {
         "status": knowledge_base["graph_status"],
         "error": knowledge_base["graph_error"],
+        "total_nodes": knowledge_base["entity_count"],
+        "total_edges": knowledge_base["relationship_count"],
+        "total_communities": knowledge_base["community_count"],
+        "is_truncated": (
+            len(data["nodes"]) < int(knowledge_base["entity_count"])
+            or len(data["edges"]) < int(knowledge_base["relationship_count"])
+            or len(communities) < int(knowledge_base["community_count"])
+        ),
         **data,
         "communities": communities,
     }
+
+
+@app.get("/api/knowledge-bases/{kb_id}/exports/options")
+async def export_options(kb_id: str, request: Request) -> list[dict]:
+    require_knowledge_base_access(kb_id, request)
+    return await asyncio.to_thread(exporter.options, kb_id)
+
+
+@app.post("/api/knowledge-bases/{kb_id}/exports")
+async def export_knowledge_base(
+    kb_id: str,
+    payload: ExportRequest,
+    request: Request,
+) -> Response:
+    require_knowledge_base_access(kb_id, request)
+    try:
+        artifact = await asyncio.to_thread(
+            exporter.build,
+            kb_id,
+            [selection.model_dump() for selection in payload.selections],
+            payload.bundle,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    ascii_name = re.sub(r"[^A-Za-z0-9._-]+", "-", artifact.filename).strip("-") or "export"
+    disposition = (
+        f'attachment; filename="{ascii_name}"; '
+        f"filename*=UTF-8''{quote(artifact.filename)}"
+    )
+    return Response(
+        content=artifact.content,
+        media_type=artifact.media_type,
+        headers={
+            "Content-Disposition": disposition,
+            "Cache-Control": "no-store",
+        },
+    )

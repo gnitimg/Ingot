@@ -52,6 +52,40 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
         )
         main.db.set_document_status(document_id, "ready", chunk_count=1)
 
+        assert client.get(
+            f"/api/knowledge-bases/{kb_id}/exports/options"
+        ).status_code == 401
+        export_options = client.get(
+            f"/api/knowledge-bases/{kb_id}/exports/options",
+            headers=auth_headers,
+        )
+        assert export_options.status_code == 200
+        assert {item["kind"] for item in export_options.json()} >= {
+            "documents", "chunks", "vectors", "graph", "communities"
+        }
+        summary_export = client.post(
+            f"/api/knowledge-bases/{kb_id}/exports",
+            headers=auth_headers,
+            json={
+                "selections": [{"kind": "summary", "format": "md"}],
+                "bundle": False,
+            },
+        )
+        assert summary_export.status_code == 200
+        assert summary_export.headers["content-type"].startswith("text/markdown")
+        assert summary_export.content.startswith(b"# ")
+        bundled_export = client.post(
+            f"/api/knowledge-bases/{kb_id}/exports",
+            headers=auth_headers,
+            json={
+                "selections": [{"kind": "summary", "format": "json"}],
+                "bundle": True,
+            },
+        )
+        assert bundled_export.status_code == 200
+        assert bundled_export.headers["content-type"] == "application/zip"
+        assert bundled_export.content.startswith(b"PK")
+
         async def slow_graph_build(target_id, *, resume=False):
             assert resume is False
             main.db.start_graph_build(target_id, 1)
