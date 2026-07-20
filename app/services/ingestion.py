@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import hashlib
 import shutil
 from pathlib import Path
 
@@ -37,6 +38,7 @@ class IngestionService:
         stored_name = f"{new_id()}_{safe_filename(original_name)}"
         stored_path = kb_dir / stored_name
         size = 0
+        hasher = hashlib.sha256()
         max_size = self.settings.max_upload_mb * 1024 * 1024
         try:
             with stored_path.open("wb") as output:
@@ -44,6 +46,7 @@ class IngestionService:
                     size += len(data)
                     if size > max_size:
                         raise ValueError(f"文件超过 {self.settings.max_upload_mb} MB 限制")
+                    hasher.update(data)
                     output.write(data)
         except Exception:
             stored_path.unlink(missing_ok=True)
@@ -52,7 +55,7 @@ class IngestionService:
             await upload.close()
 
         document_id = self.db.create_document(
-            kb_id, original_name, str(stored_path), extension.lstrip("."), size
+            kb_id, original_name, str(stored_path), extension.lstrip("."), size, hasher.hexdigest()
         )
         try:
             parsed = parse_document(
@@ -102,13 +105,17 @@ class IngestionService:
                 ocr_page_count=ocr_count,
                 warning="；".join(warnings)[:1000] or None,
             )
-            self.db.set_graph_status(kb_id, "stale")
+            self.db.invalidate_graph(
+                kb_id,
+                "文档发生变更，原图谱已清空；下次构建将从零开始",
+            )
             self.db.touch_knowledge_base(kb_id)
             return {
                 "id": document_id,
                 "filename": original_name,
                 "status": "ready",
                 "chunk_count": len(chunks),
+                "sha256": hasher.hexdigest(),
                 "extraction_method": extraction_method,
                 "page_count": parsed.page_count,
                 "ocr_page_count": ocr_count,
@@ -122,6 +129,7 @@ class IngestionService:
                 "filename": original_name,
                 "status": "error",
                 "chunk_count": 0,
+                "sha256": hasher.hexdigest(),
                 "error": str(exc),
             }
 

@@ -51,7 +51,12 @@ class RetrievalService:
         return [self._public_chunk(compatible[int(index)], float(scores[int(index)])) for index in indices]
 
     def _local_graph_context(
-        self, kb_id: str, query: str, seed_chunk_ids: list[str], limit: int = 16
+        self,
+        kb_id: str,
+        query: str,
+        seed_chunk_ids: list[str],
+        relation_limit: int = 16,
+        chunk_limit: int | None = None,
     ) -> tuple[list[dict[str, Any]], list[str]]:
         seed_entities: dict[str, dict[str, Any]] = {}
         if seed_chunk_ids:
@@ -85,7 +90,7 @@ class RetrievalService:
                 JOIN entities target ON target.id = r.target_id
                 WHERE r.kb_id = ? AND (r.source_id IN ({placeholders}) OR r.target_id IN ({placeholders}))
                 ORDER BY r.weight DESC LIMIT ?""",
-            [kb_id, *entity_ids, *entity_ids, limit],
+            [kb_id, *entity_ids, *entity_ids, relation_limit],
         )
         facts = [
             {
@@ -109,7 +114,7 @@ class RetrievalService:
                 FROM entity_chunks ec
                 WHERE ec.entity_id IN ({expanded_placeholders})
                 GROUP BY ec.chunk_id ORDER BY relevance DESC LIMIT ?""",
-            [*expanded_entities, self.settings.default_top_k],
+            [*expanded_entities, chunk_limit or self.settings.qa_evidence_count],
         )
         related_chunk_ids = [row["chunk_id"] for row in related_rows]
         return facts, related_chunk_ids
@@ -185,7 +190,7 @@ class RetrievalService:
 
         if mode in {"graph_local", "hybrid"}:
             facts, related_ids = self._local_graph_context(
-                kb_id, query, [chunk["id"] for chunk in chunks]
+                kb_id, query, [chunk["id"] for chunk in chunks], chunk_limit=limit
             )
             existing_ids = {chunk["id"] for chunk in chunks}
             extra_ids = [chunk_id for chunk_id in related_ids if chunk_id not in existing_ids]
@@ -233,9 +238,22 @@ class RetrievalService:
 
 可用证据：
 """ + context
-        cleaned_history = [
-            {"role": item["role"], "content": item["content"][:6000]}
-            for item in history[-10:]
-            if item.get("role") in {"user", "assistant"} and item.get("content")
-        ]
+        cleaned_history_reversed: list[dict[str, str]] = []
+        remaining_history_chars = 24000
+        for item in reversed(history[-20:]):
+            if (
+                item.get("role") not in {"user", "assistant"}
+                or not item.get("content")
+                or remaining_history_chars <= 0
+            ):
+                continue
+            content = str(item["content"])[:6000]
+            content = content[:remaining_history_chars]
+            if not content:
+                continue
+            cleaned_history_reversed.append(
+                {"role": str(item["role"]), "content": content}
+            )
+            remaining_history_chars -= len(content)
+        cleaned_history = list(reversed(cleaned_history_reversed))
         return [{"role": "system", "content": system}, *cleaned_history, {"role": "user", "content": query}]

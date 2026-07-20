@@ -7,8 +7,12 @@ from app.database import Database, new_id
 def test_database_cascade_and_counts(tmp_path: Path):
     db = Database(tmp_path / "test.db")
     db.initialize()
-    kb = db.create_knowledge_base("测试库", "说明")
-    document_id = db.create_document(kb["id"], "hello.txt", str(tmp_path / "hello.txt"), "txt", 10)
+    source = tmp_path / "hello.txt"
+    source.write_text("hello world", encoding="utf-8")
+    kb = db.create_knowledge_base("测试库", "说明", "secret")
+    document_id = db.create_document(
+        kb["id"], "hello.txt", str(source), "txt", source.stat().st_size, "known-hash"
+    )
     db.insert_chunks(
         document_id,
         kb["id"],
@@ -23,7 +27,14 @@ def test_database_cascade_and_counts(tmp_path: Path):
     assert result is not None
     assert result["document_count"] == 1
     assert result["chunk_count"] == 1
+    assert result["has_password"] == 1
+    assert "password_hash" not in result
+    assert db.verify_knowledge_base_password(kb["id"], "secret") is True
+    assert db.verify_knowledge_base_password(kb["id"], "wrong") is False
+    assert db.change_knowledge_base_password(kb["id"], "secret", "new-secret") is True
+    assert db.verify_knowledge_base_password(kb["id"], "new-secret") is True
     document = db.list_documents(kb["id"])[0]
+    assert document["sha256"] == "known-hash"
     assert document["extraction_method"] == "pending"
     assert document["ocr_page_count"] == 0
 
@@ -72,4 +83,38 @@ def test_initialize_migrates_legacy_document_columns(tmp_path: Path):
     connection = sqlite3.connect(path)
     columns = {row[1] for row in connection.execute("PRAGMA table_info(documents)")}
     connection.close()
-    assert {"extraction_method", "page_count", "ocr_page_count", "warning"} <= columns
+    assert {"sha256", "extraction_method", "page_count", "ocr_page_count", "warning"} <= columns
+
+
+def test_initialize_backfills_document_sha256(tmp_path: Path):
+    path = tmp_path / "legacy-hash.db"
+    source = tmp_path / "source.txt"
+    source.write_text("same content", encoding="utf-8")
+    connection = sqlite3.connect(path)
+    connection.execute(
+        """CREATE TABLE knowledge_bases (
+               id TEXT PRIMARY KEY, name TEXT, description TEXT,
+               graph_status TEXT DEFAULT 'empty', graph_error TEXT,
+               created_at TEXT, updated_at TEXT
+           )"""
+    )
+    connection.execute(
+        """CREATE TABLE documents (
+               id TEXT PRIMARY KEY, kb_id TEXT, filename TEXT, stored_path TEXT,
+               file_type TEXT, size_bytes INTEGER, chunk_count INTEGER,
+               status TEXT, error TEXT, created_at TEXT
+           )"""
+    )
+    connection.execute(
+        "INSERT INTO documents VALUES ('doc', 'kb', 'source.txt', ?, 'txt', 12, 0, 'ready', NULL, 'now')",
+        (str(source),),
+    )
+    connection.commit()
+    connection.close()
+
+    db = Database(path)
+    db.initialize()
+
+    document = db.fetch_one("SELECT sha256 FROM documents WHERE id = 'doc'")
+    assert document is not None
+    assert len(document["sha256"]) == 64

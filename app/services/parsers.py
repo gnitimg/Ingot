@@ -84,7 +84,8 @@ def _parse_pdf(path: Path, min_text_chars: int, max_ocr_pages: int, render_dpi: 
             if render_document is None:
                 if pymupdf is None:
                     result.warnings.append(
-                        f"第 {index} 页需要 OCR，但 PyMuPDF 未安装；请重新执行 pip install -r requirements.txt"
+                        f"第 {index} 页需要 OCR，但 PyMuPDF 未安装；"
+                        "请运行 pip install pymupdf"
                     )
                     continue
                 render_document = pymupdf.open(path)
