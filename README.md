@@ -1,6 +1,6 @@
 # Ingot
 
-![Version](https://img.shields.io/badge/Version-1.1-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white) ![Vue](https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white) ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white) [![Switch](https://img.shields.io/badge/Switch-EN-yellow)](README_EN.md)
+![Version](https://img.shields.io/badge/Version-1.2-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white) ![Vue](https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white) ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white) [![Switch](https://img.shields.io/badge/Switch-EN-yellow)](README_EN.md)
 
 > 本地优先的 RAG + OCR + GraphRAG 知识库应用 —— 把散落的文档锻造成可追溯的知识网络。
 
@@ -20,6 +20,7 @@ Ingot 是一个可直接在本机运行的全栈知识库应用，提供多知�
 | **可视化图谱** | 浏览器中交互查看实体关系力导向图与社区摘要 |
 | **多格式导出** | 支持全量快照、摘要、原文、文档、文本块、向量、实体、关系、图谱、社区、检查点等 11 种数据类型，可选 Markdown / JSON / CSV / HTML / GraphML / PNG 格式导出，多选可打包为 ZIP |
 | **一键配置** | 交互式初始化向导，自动写入 `.env`，支持已有配置热更新 |
+| **提供商预设** | 内置 30+ AI 服务提供商预设（SiliconFlow、OpenAI、DeepSeek、小米 MiMo、Kimi、Google Gemini、阿里云百炼等），支持快速选择和搜索 |
 
 ## 快速开始
 
@@ -248,7 +249,7 @@ event: error     ← 错误信息
 | 数据存储 | SQLite (WAL 模式) + NumPy 余弦搜索 |
 | 文档解析 | pypdf, python-docx, python-pptx, openpyxl, BeautifulSoup4；PyMuPDF（扫描 PDF 可选） |
 | 图片处理 | Pillow (EXIF 纠正 + PNG 规范化) |
-| 配置管理 | pydantic-settings (`.env` 加载) |
+| 配置管理 | pydantic-settings (`.env` 加载) + cryptography (Fernet 加密 Cookie) |
 | 前端框架 | Vue 3 (Composition API + `<script setup>`) |
 | 前端构建 | Vite 7 + TypeScript 5.9 + vue-tsc |
 | 图谱可视化 | Canvas 2D + d3-force（碰撞避让、邻域高亮、方向箭头与自动适配） |
@@ -317,7 +318,9 @@ frontend/
 ├── src/
 │   ├── App.vue             # Vue 3 主工作台（知识库/文档/问答/图谱/配置）
 │   ├── components/
-│   │   └── GraphCanvas.vue # Canvas 2D 力导向图谱可视化
+│   │   ├── GraphCanvas.vue # Canvas 2D 力导向图谱可视化
+│   │   └── ProviderCombobox.vue  # 提供商搜索选择组件
+│   ├── providers.ts        # 30+ AI 服务提供商预设数据
 │   ├── api.ts              # HTTP 客户端封装
 │   ├── types.ts            # TypeScript 类型定义
 │   └── main.ts             # Vue 应用入口

@@ -1,6 +1,6 @@
 # Ingot_En
 
-![Version](https://img.shields.io/badge/Version-1.1-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white) ![Vue](https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white) ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white) [![Switch](https://img.shields.io/badge/Switch-CN-red)](README.md)
+![Version](https://img.shields.io/badge/Version-1.2-blue) ![License](https://img.shields.io/badge/License-MIT-green) ![FastAPI](https://img.shields.io/badge/FastAPI-0.115+-009688?logo=fastapi&logoColor=white) ![Vue](https://img.shields.io/badge/Vue-3-4FC08D?logo=vue.js&logoColor=white) ![Python](https://img.shields.io/badge/Python-3.11+-3776AB?logo=python&logoColor=white) [![Switch](https://img.shields.io/badge/Switch-CN-red)](README.md)
 
 > Local-first RAG + OCR + GraphRAG knowledge-base application — forging scattered documents into a traceable knowledge network.
 
@@ -20,6 +20,7 @@ Ingot is a full-stack knowledge-base application that runs entirely on your loca
 | **Interactive Graph Visualization** | Browser-based force-directed entity-relation graph with community summaries |
 | **Multi-Format Export** | 11 data types (snapshot, summary, originals, documents, chunks, vectors, entities, relationships, graph, communities, checkpoints) in Markdown / JSON / CSV / HTML / GraphML / PNG; multi-select bundled as ZIP |
 | **One-Click Config** | Interactive initialization wizard writing `.env`; hot-update supported for existing configs |
+| **Provider Presets** | 30+ built-in AI provider presets (SiliconFlow, OpenAI, DeepSeek, Xiaomi MiMo, Kimi, Google Gemini, DashScope, etc.) with quick selection and search |
 
 ## Quick Start
 
@@ -240,7 +241,7 @@ event: error     ← Error message
 | Storage | SQLite (WAL mode) + NumPy cosine search |
 | Document Parsing | pypdf, python-docx, python-pptx, openpyxl, BeautifulSoup4; PyMuPDF (scanned PDF optional) |
 | Image Processing | Pillow (EXIF correction + PNG normalization) |
-| Config Management | pydantic-settings (`.env` loading) |
+| Config Management | pydantic-settings (`.env` loading) + cryptography (Fernet encrypted cookies) |
 | Frontend | Vue 3 (Composition API + `<script setup>`) |
 | Build | Vite 7 + TypeScript 5.9 + vue-tsc |
 | Graph Visualization | Canvas 2D + d3-force (collision avoidance, neighborhood highlighting, directional arrows, auto-fit) |
@@ -310,7 +311,9 @@ frontend/
 ├── src/
 │   ├── App.vue             # Vue 3 main workspace (KB / documents / Q&A / graph / export / settings)
 │   ├── components/
-│   │   └── GraphCanvas.vue # Canvas 2D force-directed graph visualization
+│   │   ├── GraphCanvas.vue # Canvas 2D force-directed graph visualization
+│   │   └── ProviderCombobox.vue  # Provider search & selection component
+│   ├── providers.ts        # 30+ AI provider preset data
 │   ├── api.ts              # HTTP client wrapper
 │   ├── types.ts            # TypeScript type definitions
 │   └── main.ts             # Vue app entry
