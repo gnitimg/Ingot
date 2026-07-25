@@ -34,7 +34,7 @@ class OCRService:
                 if target.fallback_text.strip()
             ]
             return fallbacks, [
-                f"{len(targets)} 页需要 OCR，但 OCR 未启用或未配置；已保留可用的原生文本，请检查 OCR_ENABLED、OCR_MODEL 和 API Key"
+                f"{len(targets)} 页需要 OCR，但 OCR 未启用或未配置（当前设备）；已保留可用的原生文本，请检查 OCR 模型和 API Key"
             ]
 
         semaphore = asyncio.Semaphore(self.settings.ocr_concurrency)

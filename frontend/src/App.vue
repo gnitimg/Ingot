@@ -4,6 +4,7 @@ import MarkdownIt from "markdown-it";
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { api } from "./api";
 import GraphCanvas from "./components/GraphCanvas.vue";
+import ProviderCombobox from "./components/ProviderCombobox.vue";
 import type {
   ChatTurn, DocumentItem, EvidenceMeta, ExportOption, ExportSelection, GraphData, GraphStatus, KnowledgeBase,
   PublicSettings, RetrievalMode, SettingsUpdate,
@@ -428,7 +429,7 @@ async function saveSettings(section?: RuntimeSettingsSection) {
     }
     settingsForm.value = refreshedForm;
     editingSettingsSection.value = null;
-    notify(`${section ? `${settingsSectionLabels[section]} ` : "全部"}配置已保存并应用`);
+    notify(`${section ? `${settingsSectionLabels[section]} ` : "全部"}配置已保存到本设备并应用`);
   } catch (error) {
     notify((error as Error).message, "error");
   } finally {
@@ -1235,7 +1236,7 @@ onBeforeUnmount(() => {
         </button>
         <div v-if="!knowledgeBases.length" class="sidebar-empty">还没有知识库。创建一个，然后导入你的第一批资料。</div>
       </nav>
-      <div class="sidebar-foot"><div class="status-line"><span class="status-dot" :class="{ online: apiOnline }" /><span>{{ apiOnline ? (settings?.embedding_configured ? "服务在线" : "等待配置 API Key") : "服务不可用" }}</span></div><div class="model-chip">{{ settings?.embedding_model || "BAAI/bge-m3" }}</div></div>
+      <div class="sidebar-foot"><div class="status-line"><span class="status-dot" :class="{ online: apiOnline }" /><span>{{ apiOnline ? (settings?.embedding_configured ? "服务在线" : "等待本设备配置 API Key") : "服务不可用" }}</span></div><div class="model-chip">{{ settings?.embedding_model || "BAAI/bge-m3" }}</div></div>
     </aside>
 
     <main class="main">
@@ -1417,13 +1418,13 @@ onBeforeUnmount(() => {
               <div><p class="eyebrow">RUNTIME CONFIGURATION</p><h2>运行配置</h2></div>
               <div class="settings-actions"><button type="button" class="button button-ghost" :disabled="savingSettings" @click="resetSettingsForm">撤销未保存</button><button type="submit" class="button button-primary" :disabled="savingSettings">{{ savingSettings ? "保存中…" : "保存并应用" }}</button></div>
             </div>
-            <!-- <div class="settings-security-note"><strong>LOCAL SECRET STORE</strong><span>保存时原子写入本机 <code>.env</code>；该文件已被 Git 忽略。当前密钥永不通过配置 API 返回。</span></div> -->
+            <div class="settings-security-note"><strong>DEVICE-ONLY SECRET</strong><span>每台设备都需要单独设置 API 地址和 Key；配置仅保存在当前设备的加密 HttpOnly Cookie 中，不写入服务器文件，也不会通过配置 API 回显。</span></div>
 
             <div class="settings-grid settings-grid-editable">
               <article class="setting-card setting-card-form" data-settings-section="embedding" :class="{ editing: editingSettingsSection === 'embedding' }" @pointerdown="beginSettingsEdit('embedding')">
                 <div class="setting-card-head"><div><strong>Embedding</strong><small>向量索引与语义检索</small></div><i class="config-status" :class="{ off: !settings.embedding_configured }" /></div>
                 <div class="config-fields">
-                  <label class="config-field config-field-wide"><span>提供商地址</span><input v-model.trim="settingsForm.embedding.base_url" type="url" required placeholder="https://api.example.com/v1"></label>
+                  <div class="config-field config-field-wide"><span>提供商</span><ProviderCombobox v-model.trim="settingsForm.embedding.base_url" capability="embedding" required></ProviderCombobox></div>
                   <label class="config-field config-field-wide"><span>模型</span><input v-model.trim="settingsForm.embedding.model" required placeholder="BAAI/bge-m3"></label>
                   <label class="config-field config-field-wide"><span>API Key <small>不回显</small></span><div class="secret-input"><input v-model="settingsForm.embedding.api_key" :type="secretVisibility.embedding ? 'text' : 'password'" autocomplete="new-password" :placeholder="secretPlaceholder(settings.embedding_configured)"><button type="button" @click="secretVisibility.embedding = !secretVisibility.embedding">{{ secretVisibility.embedding ? "隐藏" : "显示" }}</button></div></label>
                   <label class="config-field"><span>批量大小</span><input v-model.number="settingsForm.embedding.batch_size" type="number" min="1" max="128" required></label>
@@ -1436,7 +1437,7 @@ onBeforeUnmount(() => {
                 <div class="setting-card-head"><div><strong>Chat / Graph</strong><small>问答、实体关系与社区摘要</small></div><i class="config-status" :class="{ off: !settings.chat_configured }" /></div>
                 <label class="toggle-field"><input v-model="settingsForm.chat.use_embedding_provider" type="checkbox"><span>复用 Embedding 的地址和密钥</span></label>
                 <div class="config-fields">
-                  <label class="config-field config-field-wide"><span>提供商地址</span><input v-model.trim="settingsForm.chat.base_url" type="url" :disabled="settingsForm.chat.use_embedding_provider" placeholder="https://api.example.com/v1"></label>
+                  <div class="config-field config-field-wide"><span>提供商</span><ProviderCombobox v-model.trim="settingsForm.chat.base_url" capability="chat" :disabled="settingsForm.chat.use_embedding_provider"></ProviderCombobox></div>
                   <label class="config-field config-field-wide"><span>模型</span><input v-model.trim="settingsForm.chat.model" required placeholder="Qwen/Qwen3-8B"></label>
                   <label class="config-field config-field-wide"><span>API Key <small>不回显</small></span><div class="secret-input"><input v-model="settingsForm.chat.api_key" :type="secretVisibility.chat ? 'text' : 'password'" autocomplete="new-password" :disabled="settingsForm.chat.use_embedding_provider" :placeholder="secretPlaceholder(settings.chat_configured, settingsForm.chat.use_embedding_provider)"><button type="button" :disabled="settingsForm.chat.use_embedding_provider" @click="secretVisibility.chat = !secretVisibility.chat">{{ secretVisibility.chat ? "隐藏" : "显示" }}</button></div></label>
                   <label class="config-field"><span>温度</span><input v-model.number="settingsForm.chat.temperature" type="number" min="0" max="2" step="0.1" required></label>
@@ -1451,7 +1452,7 @@ onBeforeUnmount(() => {
                 <div class="setting-card-head"><div><strong>OCR</strong><small>图片与扫描 PDF 识别</small></div><label class="enabled-toggle"><input v-model="settingsForm.ocr.enabled" type="checkbox"><span>{{ settingsForm.ocr.enabled ? "启用" : "停用" }}</span></label></div>
                 <label class="toggle-field"><input v-model="settingsForm.ocr.use_embedding_provider" type="checkbox"><span>复用 Embedding 的地址和密钥</span></label>
                 <div class="config-fields" :class="{ muted: !settingsForm.ocr.enabled }">
-                  <label class="config-field config-field-wide"><span>提供商地址</span><input v-model.trim="settingsForm.ocr.base_url" type="url" :disabled="settingsForm.ocr.use_embedding_provider" placeholder="https://api.example.com/v1"></label>
+                  <div class="config-field config-field-wide"><span>提供商</span><ProviderCombobox v-model.trim="settingsForm.ocr.base_url" capability="ocr" :disabled="settingsForm.ocr.use_embedding_provider"></ProviderCombobox></div>
                   <label class="config-field config-field-wide"><span>模型</span><input v-model.trim="settingsForm.ocr.model" required placeholder="PaddlePaddle/PaddleOCR-VL-1.5"></label>
                   <label class="config-field config-field-wide"><span>API Key <small>不回显</small></span><div class="secret-input"><input v-model="settingsForm.ocr.api_key" :type="secretVisibility.ocr ? 'text' : 'password'" autocomplete="new-password" :disabled="settingsForm.ocr.use_embedding_provider" :placeholder="secretPlaceholder(settings.ocr_configured, settingsForm.ocr.use_embedding_provider)"><button type="button" :disabled="settingsForm.ocr.use_embedding_provider" @click="secretVisibility.ocr = !secretVisibility.ocr">{{ secretVisibility.ocr ? "隐藏" : "显示" }}</button></div></label>
                   <label class="config-field"><span>并发页数</span><input v-model.number="settingsForm.ocr.concurrency" type="number" min="1" max="8" required></label>
@@ -1467,7 +1468,7 @@ onBeforeUnmount(() => {
                 <div class="setting-card-head"><div><strong>Reranker</strong><small>候选结果二阶段精排</small></div><label class="enabled-toggle"><input v-model="settingsForm.rerank.enabled" type="checkbox"><span>{{ settingsForm.rerank.enabled ? "启用" : "停用" }}</span></label></div>
                 <label class="toggle-field"><input v-model="settingsForm.rerank.use_embedding_provider" type="checkbox"><span>复用 Embedding 的地址和密钥</span></label>
                 <div class="config-fields" :class="{ muted: !settingsForm.rerank.enabled }">
-                  <label class="config-field config-field-wide"><span>提供商地址</span><input v-model.trim="settingsForm.rerank.base_url" type="url" :disabled="settingsForm.rerank.use_embedding_provider" placeholder="https://api.example.com/v1"></label>
+                  <div class="config-field config-field-wide"><span>提供商</span><ProviderCombobox v-model.trim="settingsForm.rerank.base_url" capability="rerank" :disabled="settingsForm.rerank.use_embedding_provider"></ProviderCombobox></div>
                   <label class="config-field config-field-wide"><span>模型</span><input v-model.trim="settingsForm.rerank.model" required placeholder="BAAI/bge-reranker-v2-m3"></label>
                   <label class="config-field config-field-wide"><span>API Key <small>不回显</small></span><div class="secret-input"><input v-model="settingsForm.rerank.api_key" :type="secretVisibility.rerank ? 'text' : 'password'" autocomplete="new-password" :disabled="settingsForm.rerank.use_embedding_provider" :placeholder="secretPlaceholder(settings.rerank_configured, settingsForm.rerank.use_embedding_provider)"><button type="button" :disabled="settingsForm.rerank.use_embedding_provider" @click="secretVisibility.rerank = !secretVisibility.rerank">{{ secretVisibility.rerank ? "隐藏" : "显示" }}</button></div></label>
                   <label class="config-field"><span>候选数</span><input v-model.number="settingsForm.rerank.candidates" type="number" min="2" max="100" required></label>

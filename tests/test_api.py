@@ -11,7 +11,8 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
 
     get_settings.cache_clear()
     import app.main as main
-    monkeypatch.setattr(main, "ENV_PATH", tmp_path / ".env")
+    from app.services.graph_rag import GraphRAGService
+    from app.services.retrieval import RetrievalService
 
     with TestClient(main.app) as client:
         root = client.get("/")
@@ -86,7 +87,7 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
         assert bundled_export.headers["content-type"] == "application/zip"
         assert bundled_export.content.startswith(b"PK")
 
-        async def slow_graph_build(target_id, *, resume=False):
+        async def slow_graph_build(_service, target_id, *, resume=False):
             assert resume is False
             main.db.start_graph_build(target_id, 1)
             main.db.update_graph_progress(
@@ -94,7 +95,7 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
             )
             await asyncio.sleep(60)
 
-        monkeypatch.setattr(main.graph_rag, "rebuild", slow_graph_build)
+        monkeypatch.setattr(GraphRAGService, "rebuild", slow_graph_build)
         started = client.post(f"/api/knowledge-bases/{kb_id}/graph/rebuild", headers=auth_headers)
         assert started.status_code == 202
         assert started.json()["total"] == 1
@@ -117,13 +118,13 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
             ("图谱构建超过 60 分钟上限，已自动停止；可调整超时后重试", kb_id),
         )
 
-        async def finish_resumed_graph(target_id, *, resume=False):
+        async def finish_resumed_graph(_service, target_id, *, resume=False):
             assert target_id == kb_id
             assert resume is True
             main.db.set_graph_status(target_id, "ready")
             main.db.clear_graph_checkpoints(target_id)
 
-        monkeypatch.setattr(main.graph_rag, "rebuild", finish_resumed_graph)
+        monkeypatch.setattr(GraphRAGService, "rebuild", finish_resumed_graph)
         # A cached legacy frontend still posts to /rebuild. Once checkpoints
         # exist, the compatibility endpoint must resume instead of clearing them.
         resumed = client.post(f"/api/knowledge-bases/{kb_id}/graph/rebuild", headers=auth_headers)
@@ -152,7 +153,7 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
             time.sleep(0.01)
         assert resumed_state["graph_status"] == "ready"
 
-        async def partial_graph_search(target_id, query, mode, top_k):
+        async def partial_graph_search(_service, target_id, query, mode, top_k):
             assert (target_id, query, mode, top_k) == (
                 kb_id,
                 "test",
@@ -167,7 +168,7 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
                 "warnings": [],
             }
 
-        monkeypatch.setattr(main.retrieval, "search", partial_graph_search)
+        monkeypatch.setattr(RetrievalService, "search", partial_graph_search)
         main.db.execute(
             """UPDATE knowledge_bases
                SET graph_status = 'partial', graph_failed_chunks = 1
@@ -193,9 +194,12 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
         assert client.get("/api/knowledge-bases").json() == []
 
         current = client.get("/api/settings").json()
+        assert current["device_settings_present"] is False
+        assert current["settings_storage"] == "encrypted_device_cookie"
+        assert current["embedding_base_url"] == ""
         payload = {
             "embedding": {
-                "base_url": current["embedding_base_url"],
+                "base_url": "https://api.example.test/v1",
                 "model": "BAAI/bge-m3-test",
                 "api_key": "test-secret-key",
                 "batch_size": current["embedding_batch_size"],
@@ -254,9 +258,12 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
         assert updated.json()["graph_llm_entity_matching"] is False
         assert updated.json()["qa_evidence_count"] == current["qa_evidence_count"]
         assert "test-secret-key" not in updated.text
-        assert "EMBEDDING_API_KEY=test-secret-key" in (tmp_path / ".env").read_text(encoding="utf-8")
-        assert "GRAPH_CONCURRENCY=1000" in (tmp_path / ".env").read_text(encoding="utf-8")
-        assert "QA_EVIDENCE_COUNT=" in (tmp_path / ".env").read_text(encoding="utf-8")
+        assert updated.json()["device_settings_present"] is True
+        set_cookie = updated.headers["set-cookie"]
+        assert "test-secret-key" not in set_cookie
+        assert "HttpOnly" in set_cookie
+        assert "SameSite=strict" in set_cookie
+        assert not (tmp_path / ".env").exists()
 
         payload["embedding"]["api_key"] = ""
         payload["graph"]["success_threshold"] = 92.5
@@ -265,9 +272,14 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
         assert retained.status_code == 200
         assert retained.json()["graph_success_threshold"] == 92.5
         assert retained.json()["graph_llm_entity_matching"] is True
-        assert "EMBEDDING_API_KEY=test-secret-key" in (tmp_path / ".env").read_text(encoding="utf-8")
-        assert "GRAPH_SUCCESS_THRESHOLD=92.5" in (tmp_path / ".env").read_text(encoding="utf-8")
-        assert "GRAPH_LLM_ENTITY_MATCHING=true" in (tmp_path / ".env").read_text(encoding="utf-8")
+        assert retained.json()["embedding_configured"] is True
+        assert "test-secret-key" not in retained.text
+
+        client.cookies.clear()
+        other_device = client.get("/api/settings").json()
+        assert other_device["device_settings_present"] is False
+        assert other_device["embedding_configured"] is False
+        assert other_device["embedding_base_url"] == ""
 
         payload["graph"]["concurrency"] = 1001
         rejected_concurrency = client.put("/api/settings", json=payload)
@@ -275,6 +287,7 @@ def test_api_lifecycle_and_static_app(tmp_path, monkeypatch):
 
         payload["graph"]["concurrency"] = 1000
         payload["embedding"]["api_key"] = "${SHOULD_NOT_LEAK}"
-        rejected = client.put("/api/settings", json=payload)
-        assert rejected.status_code == 422
-        assert "SHOULD_NOT_LEAK" not in rejected.text
+        stored_again = client.put("/api/settings", json=payload)
+        assert stored_again.status_code == 200
+        assert "SHOULD_NOT_LEAK" not in stored_again.text
+        assert "SHOULD_NOT_LEAK" not in stored_again.headers["set-cookie"]

@@ -70,33 +70,17 @@ cd ..
 
 Build output is written directly into `app/static/`. FastAPI serves these files on the same port in production. The repo includes a pre-built production bundle, so Node.js is not required on first run — only rebuild after modifying frontend source.
 
-### 3. Run Interactive Initialization
-
-```bash
-python init.py
-```
-
-The wizard will prompt for:
-
-1. **Embedding Service** — API URL, API Key (hidden input), model name
-2. **Chat / Graph Model** — can reuse Embedding's URL and Key
-3. **OCR** — enable/disable, model, max OCR pages
-4. **Reranker** — enable/disable, model
-5. **Text Chunking** — chunk size, overlap
-
-Configuration is written to `.env`. API Keys use `getpass` for hidden input; existing valid values are preserved by pressing Enter.
-
-### 4. Start the Application
+### 3. Start the Application
 
 ```bash
 python run.py
 ```
 
-Open [http://127.0.0.1:8000](http://127.0.0.1:8000) in your browser. If `.env` is missing or contains placeholder keys, `run.py` will automatically launch the initialization wizard.
+Open [http://127.0.0.1:8000](http://127.0.0.1:8000), then configure the model API URLs and Keys for this device in any knowledge base's **Settings** tab. Every device must be configured separately.
 
 If the port is occupied, change `APP_PORT` in `.env` to another available port (e.g., `8001`).
 
-In any knowledge base's **Settings** tab, you can edit provider URLs, models, API Keys, and timeout/concurrency parameters for Embedding, Chat/Graph, OCR, and Reranker. You can also adjust QA evidence count, Chunking, GraphRAG, and the current KB's Security settings. All config cards use explicit submit — click a card to enter edit mode, and only "Save" inside the card commits the latest values. "Save & Apply" commits all runtime configs at once; "Discard" reverts all cards. Saved changes atomically write to `.env` and hot-update the current process without restart. API Keys use password inputs; existing values are not echoed; leaving the field blank retains the current key.
+The **Settings** tab covers provider URLs, models, API Keys, timeout/concurrency parameters, Chunking, GraphRAG, and KB security. Model settings are encrypted into an `HttpOnly`, `SameSite=Strict` cookie on the current device; they are not written to server `.env`, SQLite, or logs. The server decrypts them only in memory while handling that device's request or background task. Existing API Keys are never echoed; leaving a Key field blank retains the current device's value. Clearing cookies, changing browser, or using another device requires configuration again.
 
 GraphRAG concurrency can also be set in the browser (range 1–1000, recommend starting with 3–5), applying to both **entity-relation extraction** and **community summarization**. It takes effect from the next build; the current round still uses the startup value. The model uses persistent connection pools and rolling worker pools: each completed request immediately saves a checkpoint and picks up the next task. Timeout chunks go to the back of the queue without blocking healthy chunks. On 429, 5xx, network errors, or invalid responses, retries respect the provider's `Retry-After`, exponential backoff, and jitter; explicit provider throttling temporarily lowers concurrency, gradually restored after consecutive successes.
 
@@ -372,12 +356,9 @@ If a legacy data directory only contains `knowledge_forge.db`, Ingot auto-migrat
 
 ### `.env` vs `.env.example`
 
-These two files serve different purposes:
+`.env` is only for server settings such as listening address, port, data directory, and the device-cookie encryption secret. Model API URLs and Keys must not be stored there. Legacy `*_API_KEY` / `*_BASE_URL` entries are ignored as device credentials by web requests. `.env` remains git-ignored.
 
-- `.env.example` is committed to Git. It contains only public defaults and API Key placeholders for reference.
-- `.env` is local-only and contains real API Keys. It is git-ignored.
-
-Never put real keys into `.env.example`, README, source code, screenshots, or commit history. Before committing, run:
+Never put real keys into `.env`, `.env.example`, README, source code, screenshots, or commit history. Before committing, run:
 
 ```bash
 git status --short
@@ -388,12 +369,14 @@ The second command should output `.env`. If a key has entered Git history, delet
 
 ### Full Configuration Reference
 
+Non-secret model settings below can seed the UI defaults for a new device. `*_BASE_URL` and `*_API_KEY` are deprecated and ignored by the web runtime; set their actual values in each device's browser.
+
 **Embedding Service:**
 
 | Variable | Default | Description |
 |---|---|---|
-| `EMBEDDING_BASE_URL` | `https://api.siliconflow.cn/v1` | OpenAI-compatible API root URL |
-| `EMBEDDING_API_KEY` | none | Required, API Key |
+| `EMBEDDING_BASE_URL` | — | Deprecated; configure in the current device's browser |
+| `EMBEDDING_API_KEY` | — | Deprecated; configure in the current device's browser |
 | `EMBEDDING_MODEL` | `BAAI/bge-m3` | Vectorization model |
 | `EMBEDDING_BATCH_SIZE` | `16` | Texts per request |
 | `EMBEDDING_TIMEOUT` | `90` | Request timeout (seconds) |
@@ -402,8 +385,8 @@ The second command should output `.env`. If a key has entered Git history, delet
 
 | Variable | Default | Description |
 |---|---|---|
-| `CHAT_BASE_URL` | empty | Reuses Embedding URL when empty |
-| `CHAT_API_KEY` | empty | Reuses Embedding Key when empty |
+| `CHAT_BASE_URL` | — | Deprecated; configure per device or reuse Embedding |
+| `CHAT_API_KEY` | — | Deprecated; configure per device or reuse Embedding |
 | `CHAT_MODEL` | `Qwen/Qwen3-8B` | Q&A, entity-relation extraction, and community summarization model |
 | `CHAT_TIMEOUT` | `180` | Request timeout (seconds) |
 | `CHAT_TEMPERATURE` | `0.2` | Generation temperature |
@@ -414,8 +397,8 @@ The second command should output `.env`. If a key has entered Git history, delet
 | Variable | Default | Description |
 |---|---|---|
 | `OCR_ENABLED` | `true` | Auto-OCR for images and scanned PDF pages |
-| `OCR_BASE_URL` | empty | Reuses Embedding URL when empty |
-| `OCR_API_KEY` | empty | Reuses Embedding Key when empty |
+| `OCR_BASE_URL` | — | Deprecated; configure per device or reuse Embedding |
+| `OCR_API_KEY` | — | Deprecated; configure per device or reuse Embedding |
 | `OCR_MODEL` | `PaddlePaddle/PaddleOCR-VL-1.5` | Vision/OCR model |
 | `OCR_TIMEOUT` | `240` | Per-page OCR timeout (seconds) |
 | `OCR_CONCURRENCY` | `2` | Concurrent OCR pages per document |
@@ -428,8 +411,8 @@ The second command should output `.env`. If a key has entered Git history, delet
 | Variable | Default | Description |
 |---|---|---|
 | `RERANK_ENABLED` | `true` | Enable two-stage reranking |
-| `RERANK_BASE_URL` | empty | Reuses Embedding URL when empty |
-| `RERANK_API_KEY` | empty | Reuses Embedding Key when empty |
+| `RERANK_BASE_URL` | — | Deprecated; configure per device or reuse Embedding |
+| `RERANK_API_KEY` | — | Deprecated; configure per device or reuse Embedding |
 | `RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | Reranker model |
 | `RERANK_CANDIDATES` | `18` | Candidates sent to reranker after vector recall |
 | `RERANK_TIMEOUT` | `60` | Reranker request timeout (seconds) |
@@ -464,8 +447,9 @@ The second command should output `.env`. If a key has entered Git history, delet
 | `APP_PORT` | `8000` | Unified port for browser admin and API |
 | `DATA_DIR` | `./data` | Local directory for SQLite and uploaded files |
 | `MAX_UPLOAD_MB` | `50` | Per-file upload size limit |
+| `DEVICE_COOKIE_SECRET` | empty | Server encryption seed for device-setting cookies; production must use a strong random value, and rotation requires every device to reconfigure |
 
-Settings saved via the browser config page hot-update immediately; manual `.env` edits still require a restart.
+Browser settings take effect immediately for the current device. Manual server `.env` changes require a restart; do not store model API URLs or Keys there.
 
 ## API Reference
 
@@ -521,7 +505,7 @@ Password-protected knowledge bases require calling the unlock endpoint to obtain
 |---|---|---|
 | `GET` | `/api/health` | Service status and model configuration |
 | `GET` | `/api/settings` | Runtime configuration (API Keys not exposed) |
-| `PUT` | `/api/settings` | Save and hot-update model/retrieval config from local machine; API Keys not echoed |
+| `PUT` | `/api/settings` | Encrypt current-device model/retrieval settings into an HttpOnly cookie; API Keys are not echoed or persisted server-side |
 
 ## Testing
 
@@ -539,7 +523,7 @@ Tests do not call real model APIs and cover:
 |---|---|
 | `test_database.py` | SQLite cascade deletes, graph data queries, column migration, KB password hashing and document SHA256 backfill |
 | `test_database_graph_progress.py` | Graph progress, heartbeat fields, interrupted task pause/resume migration |
-| `test_api.py` | FastAPI lifecycle, KB CRUD, unlock/password change, graph start/stop, config hot-update, API Key non-echo |
+| `test_api.py` | FastAPI lifecycle, KB CRUD, unlock/password change, graph start/stop, device-cookie isolation/encryption, and API Key non-echo |
 | `test_chunker.py` | Text chunking size limits, metadata passthrough, overlap validation |
 | `test_graph_rag.py` | Markdown-fenced JSON parsing, entity normalization, community detection, progress completion, per-chunk and total timeout checkpoint recovery |
 | `test_ocr.py` | Image OCR preprocessing (EXIF + PNG), metadata preservation, unconfigured fallback |
@@ -582,8 +566,8 @@ Recommendation: set `GRAPH_MAX_CHUNKS=100` for the first build, verify results, 
 ## Security Notes
 
 - Default listening on `127.0.0.1` — localhost only
-- API Keys stored only in local `.env`; frontend and API never return existing keys; config write endpoints accept only loopback requests
+- API URLs and Keys live only in each device's encrypted HttpOnly cookie; the server does not persist them, and neither frontend JavaScript nor the settings API can read or echo existing Keys
 - KB access passwords stored as PBKDF2-SHA256 salted hashes in SQLite; no plaintext. Unlock tokens stored only in server process memory and current browser session; re-unlock required after restart or page refresh
 - KB password protection is a product-grade isolation safeguard, not a multi-user authentication system. For LAN/public deployment, add user management, HTTPS, reverse proxy auth, and rate limiting
-- Browser password fields mask and prevent echo; `.env` is a plaintext local config file, not an OS keychain. Use a dedicated Secret Manager for multi-user hosts or public deployment
+- Production must use HTTPS and a stable, strong `DEVICE_COOKIE_SECRET`; rotating it invalidates every existing device cookie
 - Before committing, verify with `git check-ignore .env` that secrets are not tracked

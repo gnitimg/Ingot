@@ -70,33 +70,17 @@ cd ..
 
 构建产物会直接写入 `app/static/`，FastAPI 在生产模式下通过同一个 localhost 端口托管这些文件。仓库已提交生产构建，因此首次运行无需 Node；修改前端源码后才需要重新执行上述构建命令。
 
-### 3. 运行交互式初始化
-
-```bash
-python init.py
-```
-
-向导会依次询问：
-
-1. **Embedding 服务** — API 地址、API Key（隐藏输入）、模型名称
-2. **Chat / 图谱模型** — 可复用 Embedding 的地址和 Key
-3. **OCR** — 是否启用、模型、最大 OCR 页数
-4. **Reranker** — 是否启用、模型
-5. **文本切分** — 单块字符数、重叠字符数
-
-配置自动写入 `.env`。API Key 使用 `getpass` 隐藏输入；已有有效配置时，直接回车保留原值。
-
-### 4. 启动应用
+### 3. 启动应用
 
 ```bash
 python run.py
 ```
 
-浏览器打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)。如果 `.env` 不存在或仍是占位 Key，`run.py` 会先自动进入初始化向导。
+浏览器打开 [http://127.0.0.1:8000](http://127.0.0.1:8000)，进入任一知识库的 **配置** 页，为当前设备设置模型 API 地址和 Key。每台设备都必须单独设置。
 
 如果 `run.py` 提示端口已被占用，请在 `.env` 中把 `APP_PORT` 改为其他空闲端口（例如 `8001`），并使用对应地址访问。不要让其他服务与 Ingot 同时监听同一端口，否则浏览器可能间歇命中错误服务并显示 404 或“服务不可用”。
 
-进入任一知识库的 **配置** 页，可以直接编辑 Embedding、Chat / Graph、OCR、Reranker 的提供商地址、模型、API Key 和超时/并发参数，也可以调整问答证据片数、Chunking、GraphRAG 与当前知识库的 Security。配置卡片均采用显式提交：点击卡片后进入编辑态，只有点击卡片内的“保存”才会提交最新值；未保存时点击卡片外部，会立即恢复该卡片最后一次已保存的值。顶部“保存并应用”仍可明确提交全部运行配置，“撤销未保存”则恢复全部卡片。配置卡片使用自适应瀑布流排列，卡片高度随内容收口。保存后会原子写入 `.env` 并热更新当前进程，无需重启。API Key 使用密码输入，已有值不会回显，输入框留空会保留原密钥；Chat、OCR 与 Reranker 也可选择复用 Embedding 的地址和 Key。Security 卡片只作用于当前知识库密码，不写入 `.env`。
+配置页可以编辑 Embedding、Chat / Graph、OCR、Reranker 的提供商地址、模型、API Key 和超时/并发参数，也可以调整问答证据片数、Chunking、GraphRAG 与当前知识库的 Security。模型配置会加密后写入当前设备的 `HttpOnly`、`SameSite=Strict` Cookie，不写入服务器 `.env`、SQLite 或日志；服务端只在处理该设备请求或其发起的后台任务时在内存中解密使用。API Key 不回显，输入框留空会保留当前设备已有密钥；Chat、OCR 与 Reranker 也可复用 Embedding 的地址和 Key。清除浏览器 Cookie、换设备或更换浏览器后都需要重新配置。
 
 GraphRAG 的“模型请求并发”也可直接在浏览器中设置（范围 1–1000，建议先用 3–5），同时作用于**实体关系抽取**和**图社区摘要**。保存后从下一次新建或继续构建开始生效；正在执行的这一轮仍使用启动时的并发数。上限 1000 是为高配私有服务或明确支持大并发的提供商预留，并不代表公共 API 都能承受该值。模型请求使用持久连接池和滚动工作池：任一请求完成后立即保存检查点并补充下一个任务，超时块进入队尾而不会阻塞同批健康块。遇到 429、5xx、网络中断或无效响应时，会结合提供商的 `Retry-After`、指数退避和随机抖动重试；明确的提供商限流会临时降低并发，连续成功后逐步恢复。Qwen 图谱抽取与社区摘要默认关闭思考模式，避免为结构化 JSON 任务消耗不必要的推理时间。
 
@@ -378,28 +362,27 @@ data/
 
 ### `.env` 与 `.env.example`
 
-这两个文件的用途不同：
+`.env` 只用于服务器监听地址、端口、数据目录和设备 Cookie 加密密钥等服务端配置；模型 API 地址和 Key 不应写入 `.env`。旧版本遗留的 `*_API_KEY` / `*_BASE_URL` 环境项不会被 Web 请求用作设备凭据。`.env` 已写入 `.gitignore`。
 
-- `.env.example` 会提交到 Git。它只包含公开的默认值和 API Key 占位符，供其他使用者复制参考。
-- `.env` 只用于当前机器，包含真实 API Key。它已经写入 `.gitignore`，不会被 Git 跟踪。
-
-请不要把真实 Key 写进 `.env.example`、README、源码、截图或提交记录。建议提交前执行：
+请不要把真实 Key 写进 `.env`、`.env.example`、README、源码、截图或提交记录。建议提交前执行：
 
 ```bash
 git status --short
 git check-ignore .env
 ```
 
-第二条命令应输出 `.env`。如果密钥曾经进入 Git 历史，仅删除文件并不够，还需要立即在 SiliconFlow 控制台撤销并重新生成 Key。
+第二条命令应输出 `.env`。如果密钥曾经进入 Git 历史，仅删除文件并不够，还需要立即在模型服务控制台撤销并重新生成 Key。
 
 ### 完整配置项
+
+以下模型参数中的非敏感项可作为新设备的界面默认值；`*_BASE_URL` 与 `*_API_KEY` 已弃用并被 Web 运行时忽略，实际值必须在各设备浏览器中设置。
 
 **Embedding 服务：**
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `EMBEDDING_BASE_URL` | `https://api.siliconflow.cn/v1` | OpenAI 兼容 API 根地址 |
-| `EMBEDDING_API_KEY` | 无 | 必填，SiliconFlow API Key |
+| `EMBEDDING_BASE_URL` | — | 已弃用；请在当前设备浏览器中设置 |
+| `EMBEDDING_API_KEY` | — | 已弃用；请在当前设备浏览器中设置 |
 | `EMBEDDING_MODEL` | `BAAI/bge-m3` | 向量模型 |
 | `EMBEDDING_BATCH_SIZE` | `16` | 每次请求的文本数 |
 | `EMBEDDING_TIMEOUT` | `90` | 单次向量请求超时秒数 |
@@ -408,8 +391,8 @@ git check-ignore .env
 
 | 变量 | 默认值 | 说明 |
 |---|---|---|
-| `CHAT_BASE_URL` | 空 | 留空时复用 Embedding 地址 |
-| `CHAT_API_KEY` | 空 | 留空时复用 Embedding Key |
+| `CHAT_BASE_URL` | — | 已弃用；请在当前设备浏览器中设置或复用 Embedding |
+| `CHAT_API_KEY` | — | 已弃用；请在当前设备浏览器中设置或复用 Embedding |
 | `CHAT_MODEL` | `Qwen/Qwen3-8B` | 问答、实体关系抽取和社区摘要模型 |
 | `CHAT_TIMEOUT` | `180` | Chat / Graph 请求超时秒数 |
 | `CHAT_TEMPERATURE` | `0.2` | 生成温度 |
@@ -420,8 +403,8 @@ git check-ignore .env
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `OCR_ENABLED` | `true` | 是否自动 OCR 图片和扫描 PDF 页 |
-| `OCR_BASE_URL` | 空 | 留空时复用 Embedding 地址 |
-| `OCR_API_KEY` | 空 | 留空时复用 Embedding Key |
+| `OCR_BASE_URL` | — | 已弃用；请在当前设备浏览器中设置或复用 Embedding |
+| `OCR_API_KEY` | — | 已弃用；请在当前设备浏览器中设置或复用 Embedding |
 | `OCR_MODEL` | `PaddlePaddle/PaddleOCR-VL-1.5` | 视觉/OCR 模型 |
 | `OCR_TIMEOUT` | `240` | 单页 OCR 请求超时秒数 |
 | `OCR_CONCURRENCY` | `2` | 单文档 OCR 并发页数 |
@@ -434,8 +417,8 @@ git check-ignore .env
 | 变量 | 默认值 | 说明 |
 |---|---|---|
 | `RERANK_ENABLED` | `true` | 是否启用二阶段精排 |
-| `RERANK_BASE_URL` | 空 | 留空时复用 Embedding 地址 |
-| `RERANK_API_KEY` | 空 | 留空时复用 Embedding Key |
+| `RERANK_BASE_URL` | — | 已弃用；请在当前设备浏览器中设置或复用 Embedding |
+| `RERANK_API_KEY` | — | 已弃用；请在当前设备浏览器中设置或复用 Embedding |
 | `RERANK_MODEL` | `BAAI/bge-reranker-v2-m3` | Reranker 模型 |
 | `RERANK_CANDIDATES` | `18` | 向量召回后送入精排的候选数 |
 | `RERANK_TIMEOUT` | `60` | Reranker 请求超时秒数 |
@@ -470,8 +453,9 @@ git check-ignore .env
 | `APP_PORT` | `8000` | 浏览器管理端与 API 的统一端口 |
 | `DATA_DIR` | `./data` | SQLite 和上传文件的本地目录 |
 | `MAX_UPLOAD_MB` | `50` | 单文件大小上限 |
+| `DEVICE_COOKIE_SECRET` | 空 | 设备配置 Cookie 的服务端加密种子；生产环境必须设置高强度随机值，轮换后所有设备需重新配置 |
 
-通过浏览器配置页保存的项目会立即热更新；如果直接在文本编辑器中修改 `.env`，仍需重启应用。
+浏览器保存后对当前设备立即生效。直接修改服务端 `.env` 仍需重启应用；不要在其中存放模型 API 地址或 Key。
 
 ## API 参考
 
@@ -527,7 +511,7 @@ git check-ignore .env
 |---|---|---|
 | `GET` | `/api/health` | 服务状态和模型配置 |
 | `GET` | `/api/settings` | 运行配置（不包含 API Key） |
-| `PUT` | `/api/settings` | 从本机保存并热更新模型/检索配置；API Key 不回显 |
+| `PUT` | `/api/settings` | 加密保存当前设备的模型/检索配置到 HttpOnly Cookie；API Key 不回显、不落盘 |
 
 ## 测试
 
@@ -545,7 +529,7 @@ cd frontend && npm run typecheck && npm run build
 |---|---|
 | `test_database.py` | SQLite 级联删除、图谱数据查询、列迁移兼容、知识库密码哈希与文档 SHA256 回填 |
 | `test_database_graph_progress.py` | 图谱进度、心跳字段与中断任务暂停恢复迁移 |
-| `test_api.py` | FastAPI 生命周期、知识库 CRUD、知识库解锁/改密、图谱启动/停止、配置热更新与密钥不回显 |
+| `test_api.py` | FastAPI 生命周期、知识库 CRUD、知识库解锁/改密、图谱启动/停止、设备 Cookie 隔离、加密与密钥不回显 |
 | `test_chunker.py` | 文本切分大小限制、元数据传递、overlap 校验 |
 | `test_graph_rag.py` | Markdown 围栏 JSON 解析、实体归一化、社区发现、进度完成、单块超时与总超时检查点恢复 |
 | `test_ocr.py` | 图片 OCR 预处理（EXIF + PNG）、元数据保留、未配置回退 |
@@ -588,8 +572,8 @@ OCR 和 GraphRAG 都会产生额外模型调用。以下参数可以控制吞吐
 ## 安全注意事项
 
 - 本应用默认只监听 `127.0.0.1`，仅本机可访问
-- API Key 只保存在本地 `.env`，前端和 API 都不会返回已有密钥；配置写接口也只接受回环地址请求
+- API 地址和 Key 只保存在各设备的加密 HttpOnly Cookie；服务端不持久化，前端 JavaScript 和配置 API 都不能读取或回显已有 Key
 - 知识库访问密码使用 PBKDF2-SHA256 加盐哈希后写入 SQLite，不保存明文；解锁令牌只保存在服务进程内存和当前浏览器会话中，服务重启或页面刷新后需要重新解锁
 - 知识库密码保护是本机产品级的误操作/隔离保护，不等同于公网多用户认证系统。若要开放到局域网或公网，仍需额外增加用户体系、HTTPS、反向代理鉴权和限流
-- 浏览器中的密码框负责遮蔽与防回显；`.env` 仍是本机明文配置文件，并非操作系统密钥链。多人主机或公网部署请改接专用 Secret Manager
+- 生产环境必须使用 HTTPS，并设置稳定的高强度 `DEVICE_COOKIE_SECRET`；轮换该值会使所有既有设备 Cookie 失效
 - 建议提交前用 `git check-ignore .env` 确认密钥未被跟踪

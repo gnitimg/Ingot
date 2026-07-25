@@ -23,6 +23,7 @@ class Settings(BaseSettings):
     app_port: int = Field(default=8000, ge=1, le=65535)
     data_dir: Path = Path("./data")
     max_upload_mb: int = Field(default=50, ge=1, le=1024)
+    device_cookie_secret: str = ""
 
     embedding_base_url: str = "https://api.siliconflow.cn/v1"
     embedding_api_key: str = ""

@@ -1,15 +1,17 @@
-"""Interactive first-run configuration for Ingot."""
+"""Interactive server configuration for Ingot.
+
+Model API URLs and keys are configured per browser device and never written here.
+"""
 
 from __future__ import annotations
 
-import getpass
 import json
 import os
+import secrets
 from pathlib import Path
 
 
 ENV_PATH = Path(__file__).resolve().parent / ".env"
-PLACEHOLDERS = {"", "***", "replace-with-your-siliconflow-key", "your-api-key"}
 
 
 def read_env(path: Path = ENV_PATH) -> dict[str, str]:
@@ -113,121 +115,39 @@ def ask_bool(label: str, default: bool) -> bool:
         print("  请输入 y 或 n。")
 
 
-def ask_secret(current: str) -> str:
-    has_current = current not in PLACEHOLDERS
-    hint = "（回车保留现有值）" if has_current else "（必填，输入不会显示）"
-    while True:
-        value = getpass.getpass(f"SiliconFlow API Key {hint}: ").strip()
-        if value:
-            return value
-        if has_current:
-            return current
-        print("  API Key 不能为空。你也可以按 Ctrl+C 退出，稍后再配置。")
-
-
 def needs_configuration(path: Path = ENV_PATH) -> bool:
-    return read_env(path).get("EMBEDDING_API_KEY", "") in PLACEHOLDERS
+    return not read_env(path).get("DEVICE_COOKIE_SECRET", "").strip()
 
 
 def configure(path: Path = ENV_PATH) -> Path:
     current = read_env(path)
-    print("\nIngot / 首次运行配置")
+    print("\nIngot / 服务端配置")
     print("=" * 38)
-    print("配置只会写入本机 .env；该文件已被 .gitignore 排除。\n")
+    print("这里只配置服务器参数；模型 API 地址和 Key 请在每台设备的浏览器中设置。\n")
 
-    embedding_base_url = ask(
-        "Embedding API 地址", current.get("EMBEDDING_BASE_URL", "https://api.siliconflow.cn/v1")
+    app_host = ask("监听地址", current.get("APP_HOST", "127.0.0.1"))
+    app_port = ask_int("监听端口", int(current.get("APP_PORT", "8000")), 1, 65535)
+    data_dir = ask("数据目录", current.get("DATA_DIR", "./data"))
+    max_upload_mb = ask_int(
+        "单文件大小上限（MB）",
+        int(current.get("MAX_UPLOAD_MB", "50")),
+        1,
+        1024,
     )
-    embedding_api_key = ask_secret(current.get("EMBEDDING_API_KEY", ""))
-    embedding_model = ask("Embedding 模型", current.get("EMBEDDING_MODEL", "BAAI/bge-m3"))
+    cookie_secret = current.get("DEVICE_COOKIE_SECRET", "").strip() or secrets.token_urlsafe(48)
 
-    print("\n对话与 GraphRAG 可直接复用上面的地址和 Key。")
-    chat_base_url = ask("Chat API 地址（留空表示复用）", current.get("CHAT_BASE_URL", ""))
-    existing_chat_key = current.get("CHAT_API_KEY", "")
-    if existing_chat_key:
-        keep = input("Chat API Key 已单独配置，回车保留；输入 r 改为复用 Embedding Key: ").strip().lower()
-        chat_api_key = "" if keep == "r" else existing_chat_key
-    else:
-        chat_api_key = ""
-    chat_model = ask("Chat / 图谱抽取模型", current.get("CHAT_MODEL", "Qwen/Qwen3-8B"))
-
-    print("\nOCR 会自动处理图片和扫描 PDF 页面，默认复用 SiliconFlow 地址和 Key。")
-    ocr_enabled = ask_bool("启用 OCR", current.get("OCR_ENABLED", "true").lower() == "true")
-    ocr_model = ask(
-        "OCR 模型",
-        current.get("OCR_MODEL", "PaddlePaddle/PaddleOCR-VL-1.5"),
+    write_env_updates(
+        {
+            "APP_HOST": app_host,
+            "APP_PORT": str(app_port),
+            "DATA_DIR": data_dir,
+            "MAX_UPLOAD_MB": str(max_upload_mb),
+            "DEVICE_COOKIE_SECRET": cookie_secret,
+        },
+        path,
     )
-    ocr_max_pages = ask_int("单文档最大 OCR 页数", int(current.get("OCR_MAX_PAGES", "100")), 1, 2000)
-
-    print("\nReranker 会对向量候选做二阶段精排，调用失败时自动回退。")
-    rerank_enabled = ask_bool(
-        "启用 Reranker", current.get("RERANK_ENABLED", "true").lower() == "true"
-    )
-    rerank_model = ask(
-        "Reranker 模型",
-        current.get("RERANK_MODEL", "BAAI/bge-reranker-v2-m3"),
-    )
-
-    print("\n文本切分参数（中文资料的推荐默认值已经填好）。")
-    chunk_size = ask_int("单块字符数", int(current.get("CHUNK_SIZE", "900")), 200, 8000)
-    while True:
-        chunk_overlap = ask_int("重叠字符数", int(current.get("CHUNK_OVERLAP", "160")), 0, 2000)
-        if chunk_overlap < chunk_size:
-            break
-        print("  重叠字符数必须小于单块字符数。")
-
-    content = f"""# 由 init.py 生成。此文件包含密钥，禁止提交到 Git。
-EMBEDDING_BASE_URL={embedding_base_url}
-EMBEDDING_API_KEY={embedding_api_key}
-EMBEDDING_MODEL={embedding_model}
-EMBEDDING_BATCH_SIZE={current.get('EMBEDDING_BATCH_SIZE', '16')}
-EMBEDDING_TIMEOUT={current.get('EMBEDDING_TIMEOUT', '90')}
-
-# 留空时复用 Embedding 服务地址和 Key。
-CHAT_BASE_URL={chat_base_url}
-CHAT_API_KEY={chat_api_key}
-CHAT_MODEL={chat_model}
-CHAT_TIMEOUT={current.get('CHAT_TIMEOUT', '180')}
-CHAT_TEMPERATURE={current.get('CHAT_TEMPERATURE', '0.2')}
-CHAT_MAX_TOKENS={current.get('CHAT_MAX_TOKENS', '2048')}
-QA_EVIDENCE_COUNT={current.get('QA_EVIDENCE_COUNT', current.get('DEFAULT_TOP_K', '6'))}
-
-# OCR 与 Reranker 留空地址/Key 时复用 Embedding 服务。
-OCR_ENABLED={str(ocr_enabled).lower()}
-OCR_BASE_URL={current.get('OCR_BASE_URL', '')}
-OCR_API_KEY={current.get('OCR_API_KEY', '')}
-OCR_MODEL={ocr_model}
-OCR_TIMEOUT={current.get('OCR_TIMEOUT', '240')}
-OCR_CONCURRENCY={current.get('OCR_CONCURRENCY', '2')}
-OCR_MIN_TEXT_CHARS={current.get('OCR_MIN_TEXT_CHARS', '80')}
-OCR_MAX_PAGES={ocr_max_pages}
-OCR_RENDER_DPI={current.get('OCR_RENDER_DPI', '144')}
-
-RERANK_ENABLED={str(rerank_enabled).lower()}
-RERANK_BASE_URL={current.get('RERANK_BASE_URL', '')}
-RERANK_API_KEY={current.get('RERANK_API_KEY', '')}
-RERANK_MODEL={rerank_model}
-RERANK_CANDIDATES={current.get('RERANK_CANDIDATES', '18')}
-RERANK_TIMEOUT={current.get('RERANK_TIMEOUT', '60')}
-
-CHUNK_SIZE={chunk_size}
-CHUNK_OVERLAP={chunk_overlap}
-DEFAULT_TOP_K={current.get('DEFAULT_TOP_K', '6')}
-GRAPH_CONCURRENCY={current.get('GRAPH_CONCURRENCY', '3')}
-GRAPH_MAX_CHUNKS={current.get('GRAPH_MAX_CHUNKS', '0')}
-GRAPH_CHUNK_TIMEOUT={current.get('GRAPH_CHUNK_TIMEOUT', '240')}
-GRAPH_BUILD_TIMEOUT={current.get('GRAPH_BUILD_TIMEOUT', '3600')}
-GRAPH_RETRY_ROUNDS={current.get('GRAPH_RETRY_ROUNDS', '2')}
-GRAPH_RETRY_BACKOFF={current.get('GRAPH_RETRY_BACKOFF', '2')}
-GRAPH_SUCCESS_THRESHOLD={current.get('GRAPH_SUCCESS_THRESHOLD', '90')}
-GRAPH_LLM_ENTITY_MATCHING={current.get('GRAPH_LLM_ENTITY_MATCHING', 'false')}
-APP_HOST={current.get('APP_HOST', '127.0.0.1')}
-APP_PORT={current.get('APP_PORT', '8000')}
-DATA_DIR={current.get('DATA_DIR', './data')}
-MAX_UPLOAD_MB={current.get('MAX_UPLOAD_MB', '50')}
-"""
-    path.write_text(content, encoding="utf-8")
     print(f"\n✓ 配置已保存到 {path}")
+    print("  设备 Cookie 加密密钥已安全生成/保留，不会在终端显示。")
     print("  现在运行：python run.py\n")
     return path
 

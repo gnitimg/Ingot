@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 import numpy as np
@@ -44,6 +45,8 @@ class AIOutputTruncatedError(AIServiceError):
 
 
 class AIClient:
+    AIHUBMIX_APP_CODE = "YDQJ8558"
+
     def __init__(self, settings: Settings, client: httpx.AsyncClient | None = None):
         self.settings = settings
         self._client = client
@@ -85,9 +88,13 @@ class AIClient:
         delay = max(0.0, min(delay, 60.0))
         return min(60.0, delay + random.uniform(0, min(1.5, delay * 0.25)))
 
-    @staticmethod
-    def _headers(api_key: str) -> dict[str, str]:
-        return {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+    @classmethod
+    def _headers(cls, api_key: str, url: str = "") -> dict[str, str]:
+        headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
+        hostname = (urlparse(url).hostname or "").casefold()
+        if hostname == "aihubmix.com" or hostname.endswith(".aihubmix.com"):
+            headers["APP-Code"] = cls.AIHUBMIX_APP_CODE
+        return headers
 
     async def _post_json(
         self,
@@ -99,7 +106,7 @@ class AIClient:
         max_attempts: int = 4,
     ) -> dict[str, Any]:
         if api_key.strip() in API_KEY_PLACEHOLDERS:
-            raise AIServiceError("模型服务 API Key 未配置，请先运行 init.py 或检查 .env")
+            raise AIServiceError("当前设备尚未配置模型服务 API Key，请在运行配置中设置")
         client = self._http_client()
         last_error: Exception | None = None
         response: httpx.Response | None = None
@@ -108,7 +115,7 @@ class AIClient:
             try:
                 response = await client.post(
                     url,
-                    headers=self._headers(api_key),
+                    headers=self._headers(api_key, url),
                     json=payload,
                     timeout=timeout,
                 )
@@ -196,7 +203,7 @@ class AIClient:
 
     async def ocr_document(self, content: bytes, mime_type: str) -> str:
         if not self.settings.ocr_configured:
-            raise AIServiceError("OCR 未配置，请在 .env 中启用并填写 OCR_MODEL/API Key")
+            raise AIServiceError("当前设备尚未配置 OCR，请在运行配置中启用并填写模型/API Key")
         encoded = base64.b64encode(content).decode("ascii")
         prompt = (
             "<image>\n<|grounding|>Convert the document to markdown."
@@ -350,7 +357,7 @@ class AIClient:
     async def chat_stream(self, messages: list[dict[str, str]]) -> AsyncIterator[str]:
         api_key = self.settings.effective_chat_api_key
         if api_key.strip() in API_KEY_PLACEHOLDERS:
-            raise AIServiceError("API Key 未配置，请先在 .env 中填写 EMBEDDING_API_KEY 或 CHAT_API_KEY")
+            raise AIServiceError("当前设备尚未配置 API Key，请在运行配置中设置")
         payload = {
             "model": self.settings.chat_model,
             "messages": messages,
@@ -361,7 +368,7 @@ class AIClient:
         url = f"{self.settings.effective_chat_base_url.rstrip('/')}/chat/completions"
         try:
             async with httpx.AsyncClient(timeout=self.settings.chat_timeout) as client:
-                async with client.stream("POST", url, headers=self._headers(api_key), json=payload) as response:
+                async with client.stream("POST", url, headers=self._headers(api_key, url), json=payload) as response:
                     response.raise_for_status()
                     async for line in response.aiter_lines():
                         if not line.startswith("data:"):

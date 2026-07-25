@@ -1,18 +1,20 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
 import re
 import secrets
 from contextlib import asynccontextmanager
-from ipaddress import ip_address
+from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
 
+from cryptography.fernet import Fernet, InvalidToken
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile, status
-from fastapi.responses import FileResponse, Response, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import SecretStr
 
@@ -32,68 +34,149 @@ from app.services.exporter import KnowledgeBaseExporter
 from app.services.graph_rag import GraphRAGService
 from app.services.ingestion import IngestionService
 from app.services.retrieval import RetrievalService
-from init import ENV_PATH, write_env_updates
 
 
 settings = get_settings()
 db = Database(settings.database_path)
-ai = AIClient(settings)
-ingestion = IngestionService(db, ai, settings)
-graph_rag = GraphRAGService(db, ai, settings)
-retrieval = RetrievalService(db, ai, settings)
 exporter = KnowledgeBaseExporter(db)
 static_dir = Path(__file__).parent / "static"
-settings_update_lock = asyncio.Lock()
 graph_tasks: dict[str, asyncio.Task[None]] = {}
 GRAPH_USABLE_STATUSES = {"ready", "partial"}
 kb_access_tokens: dict[str, set[str]] = {}
 
-RUNTIME_ENV_KEYS = {
-    "embedding_base_url": "EMBEDDING_BASE_URL",
-    "embedding_api_key": "EMBEDDING_API_KEY",
-    "embedding_model": "EMBEDDING_MODEL",
-    "embedding_batch_size": "EMBEDDING_BATCH_SIZE",
-    "embedding_timeout": "EMBEDDING_TIMEOUT",
-    "chat_base_url": "CHAT_BASE_URL",
-    "chat_api_key": "CHAT_API_KEY",
-    "chat_model": "CHAT_MODEL",
-    "chat_timeout": "CHAT_TIMEOUT",
-    "chat_temperature": "CHAT_TEMPERATURE",
-    "chat_max_tokens": "CHAT_MAX_TOKENS",
-    "ocr_enabled": "OCR_ENABLED",
-    "ocr_base_url": "OCR_BASE_URL",
-    "ocr_api_key": "OCR_API_KEY",
-    "ocr_model": "OCR_MODEL",
-    "ocr_timeout": "OCR_TIMEOUT",
-    "ocr_concurrency": "OCR_CONCURRENCY",
-    "ocr_min_text_chars": "OCR_MIN_TEXT_CHARS",
-    "ocr_max_pages": "OCR_MAX_PAGES",
-    "ocr_render_dpi": "OCR_RENDER_DPI",
-    "rerank_enabled": "RERANK_ENABLED",
-    "rerank_base_url": "RERANK_BASE_URL",
-    "rerank_api_key": "RERANK_API_KEY",
-    "rerank_model": "RERANK_MODEL",
-    "rerank_candidates": "RERANK_CANDIDATES",
-    "rerank_timeout": "RERANK_TIMEOUT",
-    "chunk_size": "CHUNK_SIZE",
-    "chunk_overlap": "CHUNK_OVERLAP",
-    "default_top_k": "DEFAULT_TOP_K",
-    "qa_evidence_count": "QA_EVIDENCE_COUNT",
-    "graph_concurrency": "GRAPH_CONCURRENCY",
-    "graph_max_chunks": "GRAPH_MAX_CHUNKS",
-    "graph_chunk_timeout": "GRAPH_CHUNK_TIMEOUT",
-    "graph_build_timeout": "GRAPH_BUILD_TIMEOUT",
-    "graph_retry_rounds": "GRAPH_RETRY_ROUNDS",
-    "graph_retry_backoff": "GRAPH_RETRY_BACKOFF",
-    "graph_success_threshold": "GRAPH_SUCCESS_THRESHOLD",
-    "graph_llm_entity_matching": "GRAPH_LLM_ENTITY_MATCHING",
-}
+DEVICE_COOKIE_NAME = "ingot_device_settings"
+DEVICE_COOKIE_MAX_AGE = 365 * 24 * 60 * 60
+DEVICE_SETTING_FIELDS = (
+    "embedding_base_url",
+    "embedding_api_key",
+    "embedding_model",
+    "embedding_batch_size",
+    "embedding_timeout",
+    "chat_base_url",
+    "chat_api_key",
+    "chat_model",
+    "chat_timeout",
+    "chat_temperature",
+    "chat_max_tokens",
+    "ocr_enabled",
+    "ocr_base_url",
+    "ocr_api_key",
+    "ocr_model",
+    "ocr_timeout",
+    "ocr_concurrency",
+    "ocr_min_text_chars",
+    "ocr_max_pages",
+    "ocr_render_dpi",
+    "rerank_enabled",
+    "rerank_base_url",
+    "rerank_api_key",
+    "rerank_model",
+    "rerank_candidates",
+    "rerank_timeout",
+    "chunk_size",
+    "chunk_overlap",
+    "default_top_k",
+    "qa_evidence_count",
+    "graph_concurrency",
+    "graph_max_chunks",
+    "graph_chunk_timeout",
+    "graph_build_timeout",
+    "graph_retry_rounds",
+    "graph_retry_backoff",
+    "graph_success_threshold",
+    "graph_llm_entity_matching",
+)
+_cookie_secret = settings.device_cookie_secret.strip() or secrets.token_urlsafe(48)
+_cookie_key = base64.urlsafe_b64encode(hashlib.sha256(_cookie_secret.encode("utf-8")).digest())
+device_settings_cipher = Fernet(_cookie_key)
 
 
-def _env_value(value: object) -> str:
-    if isinstance(value, bool):
-        return str(value).lower()
-    return str(value)
+@dataclass
+class RuntimeServices:
+    settings: Settings
+    ai: AIClient
+    ingestion: IngestionService
+    graph_rag: GraphRAGService
+    retrieval: RetrievalService
+
+    async def aclose(self) -> None:
+        await self.ai.aclose()
+
+
+def _runtime_from_settings(device_settings: Settings) -> RuntimeServices:
+    ai = AIClient(device_settings)
+    return RuntimeServices(
+        settings=device_settings,
+        ai=ai,
+        ingestion=IngestionService(db, ai, device_settings),
+        graph_rag=GraphRAGService(db, ai, device_settings),
+        retrieval=RetrievalService(db, ai, device_settings),
+    )
+
+
+def _default_device_settings() -> Settings:
+    values = settings.model_dump()
+    values.update(
+        embedding_base_url="",
+        embedding_api_key="",
+        chat_base_url="",
+        chat_api_key="",
+        ocr_base_url="",
+        ocr_api_key="",
+        rerank_base_url="",
+        rerank_api_key="",
+    )
+    return Settings(_env_file=None, **values)
+
+
+def _device_settings_from_request(request: Request) -> tuple[Settings, bool]:
+    token = request.cookies.get(DEVICE_COOKIE_NAME)
+    if not token:
+        return _default_device_settings(), False
+    try:
+        payload = json.loads(
+            device_settings_cipher.decrypt(
+                token.encode("ascii"),
+                ttl=DEVICE_COOKIE_MAX_AGE,
+            )
+        )
+        if not isinstance(payload, dict):
+            raise ValueError
+        values = settings.model_dump()
+        values.update({field: payload[field] for field in DEVICE_SETTING_FIELDS if field in payload})
+        return Settings(_env_file=None, **values), True
+    except (InvalidToken, UnicodeError, ValueError, TypeError, json.JSONDecodeError):
+        return _default_device_settings(), False
+
+
+def _cookie_is_secure(request: Request) -> bool:
+    forwarded_proto = request.headers.get("x-forwarded-proto", "").split(",", 1)[0].strip()
+    return request.url.scheme == "https" or forwarded_proto == "https"
+
+
+def _store_device_settings(
+    response: Response,
+    request: Request,
+    device_settings: Settings,
+) -> None:
+    payload = {
+        field: getattr(device_settings, field)
+        for field in DEVICE_SETTING_FIELDS
+    }
+    token = device_settings_cipher.encrypt(
+        json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    ).decode("ascii")
+    if len(token) > 3800:
+        raise HTTPException(status_code=413, detail="设备配置超过 Cookie 容量限制")
+    response.set_cookie(
+        DEVICE_COOKIE_NAME,
+        token,
+        max_age=DEVICE_COOKIE_MAX_AGE,
+        path="/api",
+        secure=_cookie_is_secure(request),
+        httponly=True,
+        samesite="strict",
+    )
 
 
 def _retained_secret(replacement: SecretStr | None, current: str) -> str:
@@ -103,11 +186,11 @@ def _retained_secret(replacement: SecretStr | None, current: str) -> str:
     return value or current
 
 
-def _candidate_settings(payload: SettingsUpdate) -> Settings:
-    values = settings.model_dump()
+def _candidate_settings(payload: SettingsUpdate, current: Settings) -> Settings:
+    values = current.model_dump()
     values.update(
         embedding_base_url=payload.embedding.base_url,
-        embedding_api_key=_retained_secret(payload.embedding.api_key, settings.embedding_api_key),
+        embedding_api_key=_retained_secret(payload.embedding.api_key, current.embedding_api_key),
         embedding_model=payload.embedding.model,
         embedding_batch_size=payload.embedding.batch_size,
         embedding_timeout=payload.embedding.timeout,
@@ -115,7 +198,7 @@ def _candidate_settings(payload: SettingsUpdate) -> Settings:
         chat_api_key=(
             ""
             if payload.chat.use_embedding_provider
-            else _retained_secret(payload.chat.api_key, settings.chat_api_key)
+            else _retained_secret(payload.chat.api_key, current.chat_api_key)
         ),
         chat_model=payload.chat.model,
         chat_timeout=payload.chat.timeout,
@@ -127,7 +210,7 @@ def _candidate_settings(payload: SettingsUpdate) -> Settings:
         ocr_api_key=(
             ""
             if payload.ocr.use_embedding_provider
-            else _retained_secret(payload.ocr.api_key, settings.ocr_api_key)
+            else _retained_secret(payload.ocr.api_key, current.ocr_api_key)
         ),
         ocr_model=payload.ocr.model,
         ocr_timeout=payload.ocr.timeout,
@@ -140,7 +223,7 @@ def _candidate_settings(payload: SettingsUpdate) -> Settings:
         rerank_api_key=(
             ""
             if payload.rerank.use_embedding_provider
-            else _retained_secret(payload.rerank.api_key, settings.rerank_api_key)
+            else _retained_secret(payload.rerank.api_key, current.rerank_api_key)
         ),
         rerank_model=payload.rerank.model,
         rerank_candidates=payload.rerank.candidates,
@@ -155,12 +238,12 @@ def _candidate_settings(payload: SettingsUpdate) -> Settings:
         graph_retry_rounds=payload.graph.retry_rounds,
         graph_retry_backoff=payload.graph.retry_backoff,
         graph_success_threshold=(
-            settings.graph_success_threshold
+            current.graph_success_threshold
             if payload.graph.success_threshold is None
             else payload.graph.success_threshold
         ),
         graph_llm_entity_matching=(
-            settings.graph_llm_entity_matching
+            current.graph_llm_entity_matching
             if payload.graph.llm_entity_matching is None
             else payload.graph.llm_entity_matching
         ),
@@ -172,8 +255,6 @@ def _candidate_settings(payload: SettingsUpdate) -> Settings:
 async def lifespan(_: FastAPI):
     settings.ensure_directories()
     db.initialize()
-    for knowledge_base in db.list_knowledge_bases():
-        begin_partial_finalization(knowledge_base)
     try:
         yield
     finally:
@@ -186,7 +267,6 @@ async def lifespan(_: FastAPI):
                 knowledge_base = db.get_knowledge_base(kb_id)
                 if knowledge_base and knowledge_base["graph_status"] == "building":
                     db.pause_graph_build(kb_id, "服务停止导致图谱构建暂停，可从当前检查点继续")
-        await ai.aclose()
 
 
 app = FastAPI(
@@ -239,16 +319,18 @@ def model_error(exc: Exception) -> HTTPException:
 
 async def run_graph_build(
     kb_id: str,
+    runtime: RuntimeServices,
     *,
     resume: bool = False,
     finalize_partial: bool = False,
 ) -> None:
     try:
         if finalize_partial:
-            await graph_rag.finalize_partial(kb_id)
+            await runtime.graph_rag.finalize_partial(kb_id)
         else:
-            await graph_rag.rebuild(kb_id, resume=resume)
+            await runtime.graph_rag.rebuild(kb_id, resume=resume)
     finally:
+        await runtime.aclose()
         current_task = asyncio.current_task()
         if graph_tasks.get(kb_id) is current_task:
             graph_tasks.pop(kb_id, None)
@@ -274,6 +356,7 @@ async def cancel_active_graph_task(kb_id: str) -> None:
 
 def launch_graph_task(
     kb_id: str,
+    runtime: RuntimeServices,
     *,
     resume: bool,
     finalize_partial: bool = False,
@@ -281,6 +364,7 @@ def launch_graph_task(
     task = asyncio.create_task(
         run_graph_build(
             kb_id,
+            runtime,
             resume=resume,
             finalize_partial=finalize_partial,
         ),
@@ -294,7 +378,10 @@ def launch_graph_task(
     task.add_done_callback(lambda completed: forget_graph_task(kb_id, completed))
 
 
-def begin_partial_finalization(knowledge_base: dict) -> dict | None:
+def begin_partial_finalization(
+    knowledge_base: dict,
+    runtime: RuntimeServices,
+) -> dict | None:
     if knowledge_base.get("graph_status") != "paused":
         return None
     kb_id = str(knowledge_base["id"])
@@ -306,42 +393,46 @@ def begin_partial_finalization(knowledge_base: dict) -> dict | None:
     )
     if (
         not checkpoint["succeeded"]
-        or success_ratio < settings.graph_success_threshold
+        or success_ratio < runtime.settings.graph_success_threshold
     ):
         return None
     db.update_graph_progress(
         kb_id,
         stage=(
             "matching"
-            if settings.graph_llm_entity_matching
+            if runtime.settings.graph_llm_entity_matching
             else "communities"
         ),
         current=checkpoint["succeeded"],
         total=checkpoint["total"],
         failed_chunks=checkpoint["total"] - checkpoint["succeeded"],
     )
-    launch_graph_task(kb_id, resume=False, finalize_partial=True)
+    launch_graph_task(kb_id, runtime, resume=False, finalize_partial=True)
     return {
         "status": "building",
         "resumed": True,
         "finalizing_partial": True,
-        "stage": "matching" if settings.graph_llm_entity_matching else "communities",
+        "stage": "matching" if runtime.settings.graph_llm_entity_matching else "communities",
         "current": checkpoint["succeeded"],
         "total": checkpoint["total"],
         "failed": checkpoint["failed"],
     }
 
 
-def resume_graph_from_checkpoint(kb_id: str, knowledge_base: dict) -> dict:
+def resume_graph_from_checkpoint(
+    kb_id: str,
+    knowledge_base: dict,
+    runtime: RuntimeServices,
+) -> dict:
     checkpoint = db.graph_checkpoint_stats(kb_id)
     if not checkpoint["total"]:
         raise HTTPException(status_code=409, detail="构建检查点不存在，请从零重新构建")
-    finalizing = begin_partial_finalization(knowledge_base)
+    finalizing = begin_partial_finalization(knowledge_base, runtime)
     if finalizing is not None:
         return finalizing
     db.resume_graph_build(kb_id)
     checkpoint = db.graph_checkpoint_stats(kb_id)
-    launch_graph_task(kb_id, resume=True)
+    launch_graph_task(kb_id, runtime, resume=True)
     return {
         "status": "building",
         "resumed": True,
@@ -350,16 +441,6 @@ def resume_graph_from_checkpoint(kb_id: str, knowledge_base: dict) -> dict:
         "total": checkpoint["total"],
         "failed": checkpoint["failed"],
     }
-
-
-def require_local_request(request: Request) -> None:
-    host = request.client.host if request.client else ""
-    try:
-        is_local = ip_address(host).is_loopback
-    except ValueError:
-        is_local = host == "testclient"
-    if not is_local:
-        raise HTTPException(status_code=403, detail="运行配置只能从本机修改")
 
 
 @app.get("/", include_in_schema=False)
@@ -373,94 +454,91 @@ async def favicon() -> FileResponse:
 
 
 @app.get("/api/health")
-async def health() -> dict:
+async def health(request: Request) -> dict:
+    device_settings, stored = _device_settings_from_request(request)
     return {
         "status": "ok",
-        "embedding_configured": settings.embedding_configured,
-        "chat_configured": settings.chat_configured,
-        "ocr_configured": settings.ocr_configured,
-        "rerank_configured": settings.rerank_configured,
-        "embedding_model": settings.embedding_model,
-        "chat_model": settings.chat_model,
-        "ocr_model": settings.ocr_model,
-        "rerank_model": settings.rerank_model,
+        "device_settings_present": stored,
+        "embedding_configured": device_settings.embedding_configured,
+        "chat_configured": device_settings.chat_configured,
+        "ocr_configured": device_settings.ocr_configured,
+        "rerank_configured": device_settings.rerank_configured,
+        "embedding_model": device_settings.embedding_model,
+        "chat_model": device_settings.chat_model,
+        "ocr_model": device_settings.ocr_model,
+        "rerank_model": device_settings.rerank_model,
     }
 
 
 @app.get("/api/settings")
-async def public_settings() -> dict:
+async def public_settings(request: Request) -> dict:
+    device_settings, stored = _device_settings_from_request(request)
+    return _public_settings(device_settings, stored)
+
+
+def _public_settings(device_settings: Settings, stored: bool = True) -> dict:
     return {
-        "embedding_base_url": settings.embedding_base_url,
-        "embedding_model": settings.embedding_model,
-        "embedding_configured": settings.embedding_configured,
-        "embedding_batch_size": settings.embedding_batch_size,
-        "embedding_timeout": settings.embedding_timeout,
-        "chat_base_url": settings.effective_chat_base_url,
-        "chat_model": settings.chat_model,
-        "chat_configured": settings.chat_configured,
+        "device_settings_present": stored,
+        "settings_storage": "encrypted_device_cookie",
+        "embedding_base_url": device_settings.embedding_base_url,
+        "embedding_model": device_settings.embedding_model,
+        "embedding_configured": device_settings.embedding_configured,
+        "embedding_batch_size": device_settings.embedding_batch_size,
+        "embedding_timeout": device_settings.embedding_timeout,
+        "chat_base_url": device_settings.effective_chat_base_url,
+        "chat_model": device_settings.chat_model,
+        "chat_configured": device_settings.chat_configured,
         "chat_uses_embedding_provider": (
-            not settings.chat_base_url.strip() and not settings.chat_api_key.strip()
+            not device_settings.chat_base_url.strip() and not device_settings.chat_api_key.strip()
         ),
-        "chat_timeout": settings.chat_timeout,
-        "chat_temperature": settings.chat_temperature,
-        "chat_max_tokens": settings.chat_max_tokens,
-        "qa_evidence_count": settings.qa_evidence_count,
-        "ocr_enabled": settings.ocr_enabled,
-        "ocr_base_url": settings.effective_ocr_base_url,
-        "ocr_model": settings.ocr_model,
-        "ocr_configured": settings.ocr_configured,
+        "chat_timeout": device_settings.chat_timeout,
+        "chat_temperature": device_settings.chat_temperature,
+        "chat_max_tokens": device_settings.chat_max_tokens,
+        "qa_evidence_count": device_settings.qa_evidence_count,
+        "ocr_enabled": device_settings.ocr_enabled,
+        "ocr_base_url": device_settings.effective_ocr_base_url,
+        "ocr_model": device_settings.ocr_model,
+        "ocr_configured": device_settings.ocr_configured,
         "ocr_uses_embedding_provider": (
-            not settings.ocr_base_url.strip() and not settings.ocr_api_key.strip()
+            not device_settings.ocr_base_url.strip() and not device_settings.ocr_api_key.strip()
         ),
-        "ocr_timeout": settings.ocr_timeout,
-        "ocr_concurrency": settings.ocr_concurrency,
-        "ocr_min_text_chars": settings.ocr_min_text_chars,
-        "ocr_max_pages": settings.ocr_max_pages,
-        "ocr_render_dpi": settings.ocr_render_dpi,
-        "rerank_enabled": settings.rerank_enabled,
-        "rerank_base_url": settings.effective_rerank_base_url,
-        "rerank_model": settings.rerank_model,
-        "rerank_configured": settings.rerank_configured,
+        "ocr_timeout": device_settings.ocr_timeout,
+        "ocr_concurrency": device_settings.ocr_concurrency,
+        "ocr_min_text_chars": device_settings.ocr_min_text_chars,
+        "ocr_max_pages": device_settings.ocr_max_pages,
+        "ocr_render_dpi": device_settings.ocr_render_dpi,
+        "rerank_enabled": device_settings.rerank_enabled,
+        "rerank_base_url": device_settings.effective_rerank_base_url,
+        "rerank_model": device_settings.rerank_model,
+        "rerank_configured": device_settings.rerank_configured,
         "rerank_uses_embedding_provider": (
-            not settings.rerank_base_url.strip() and not settings.rerank_api_key.strip()
+            not device_settings.rerank_base_url.strip() and not device_settings.rerank_api_key.strip()
         ),
-        "rerank_candidates": settings.rerank_candidates,
-        "rerank_timeout": settings.rerank_timeout,
-        "chunk_size": settings.chunk_size,
-        "chunk_overlap": settings.chunk_overlap,
-        "default_top_k": settings.default_top_k,
+        "rerank_candidates": device_settings.rerank_candidates,
+        "rerank_timeout": device_settings.rerank_timeout,
+        "chunk_size": device_settings.chunk_size,
+        "chunk_overlap": device_settings.chunk_overlap,
+        "default_top_k": device_settings.default_top_k,
         "max_upload_mb": settings.max_upload_mb,
-        "graph_concurrency": settings.graph_concurrency,
-        "graph_max_chunks": settings.graph_max_chunks,
-        "graph_chunk_timeout": settings.graph_chunk_timeout,
-        "graph_build_timeout": settings.graph_build_timeout,
-        "graph_retry_rounds": settings.graph_retry_rounds,
-        "graph_retry_backoff": settings.graph_retry_backoff,
-        "graph_success_threshold": settings.graph_success_threshold,
-        "graph_llm_entity_matching": settings.graph_llm_entity_matching,
+        "graph_concurrency": device_settings.graph_concurrency,
+        "graph_max_chunks": device_settings.graph_max_chunks,
+        "graph_chunk_timeout": device_settings.graph_chunk_timeout,
+        "graph_build_timeout": device_settings.graph_build_timeout,
+        "graph_retry_rounds": device_settings.graph_retry_rounds,
+        "graph_retry_backoff": device_settings.graph_retry_backoff,
+        "graph_success_threshold": device_settings.graph_success_threshold,
+        "graph_llm_entity_matching": device_settings.graph_llm_entity_matching,
     }
 
 
 @app.put("/api/settings")
-async def update_settings(payload: SettingsUpdate, request: Request) -> dict:
-    require_local_request(request)
-    async with settings_update_lock:
-        candidate = _candidate_settings(payload)
-        env_updates = {
-            env_key: _env_value(getattr(candidate, field_name))
-            for field_name, env_key in RUNTIME_ENV_KEYS.items()
-        }
-        try:
-            await asyncio.to_thread(write_env_updates, env_updates, ENV_PATH)
-        except ValueError as exc:
-            raise HTTPException(status_code=422, detail=str(exc)) from exc
-        except OSError as exc:
-            raise HTTPException(status_code=500, detail="无法安全写入本地 .env 配置") from exc
-
-        for field_name in RUNTIME_ENV_KEYS:
-            setattr(settings, field_name, getattr(candidate, field_name))
-
-    return await public_settings()
+async def update_settings(payload: SettingsUpdate, request: Request) -> Response:
+    current, _ = _device_settings_from_request(request)
+    candidate = _candidate_settings(payload, current)
+    response = JSONResponse(_public_settings(candidate))
+    _store_device_settings(response, request, candidate)
+    response.headers["Cache-Control"] = "no-store"
+    return response
 
 
 @app.get("/api/knowledge-bases")
@@ -520,8 +598,8 @@ async def delete_knowledge_base(kb_id: str, request: Request) -> None:
     paths = db.delete_knowledge_base(kb_id)
     revoke_kb_access_tokens(kb_id)
     for path in paths:
-        ingestion.remove_file(path)
-    ingestion.remove_tree(settings.upload_dir / kb_id)
+        IngestionService.remove_file(path)
+    IngestionService.remove_tree(settings.upload_dir / kb_id)
 
 
 @app.get("/api/knowledge-bases/{kb_id}/documents")
@@ -543,15 +621,20 @@ async def upload_documents(
             kb_id,
             "文档发生变更，原构建检查点和部分图谱已清空；下次构建将从零开始",
         )
+    device_settings, _ = _device_settings_from_request(request)
+    runtime = _runtime_from_settings(device_settings)
     results = []
-    for upload in files:
-        try:
-            results.append(await ingestion.ingest_upload(kb_id, upload))
-        except (ValueError, AIServiceError) as exc:
-            await upload.close()
-            results.append(
-                {"id": None, "filename": upload.filename, "status": "error", "chunk_count": 0, "error": str(exc)}
-            )
+    try:
+        for upload in files:
+            try:
+                results.append(await runtime.ingestion.ingest_upload(kb_id, upload))
+            except (ValueError, AIServiceError) as exc:
+                await upload.close()
+                results.append(
+                    {"id": None, "filename": upload.filename, "status": "error", "chunk_count": 0, "error": str(exc)}
+                )
+    finally:
+        await runtime.aclose()
     return {"documents": results}
 
 
@@ -562,7 +645,7 @@ async def delete_document(kb_id: str, document_id: str, request: Request) -> Non
     path = db.delete_document(kb_id, document_id)
     if path is None:
         raise HTTPException(status_code=404, detail="文档不存在")
-    ingestion.remove_file(path)
+    IngestionService.remove_file(path)
 
 
 @app.post("/api/knowledge-bases/{kb_id}/search")
@@ -575,10 +658,19 @@ async def search(kb_id: str, payload: SearchRequest, request: Request) -> dict:
         and knowledge_base["graph_status"] not in GRAPH_USABLE_STATUSES
     ):
         raise HTTPException(status_code=409, detail="图谱尚未构建完成")
+    device_settings, _ = _device_settings_from_request(request)
+    runtime = _runtime_from_settings(device_settings)
     try:
-        return await retrieval.search(kb_id, payload.query, payload.mode, payload.top_k)
+        return await runtime.retrieval.search(
+            kb_id,
+            payload.query,
+            payload.mode,
+            payload.top_k,
+        )
     except AIServiceError as exc:
         raise model_error(exc) from exc
+    finally:
+        await runtime.aclose()
 
 
 @app.post("/api/knowledge-bases/{kb_id}/chat")
@@ -594,11 +686,19 @@ async def chat(kb_id: str, payload: ChatRequest, request: Request) -> StreamingR
     effective_mode = payload.mode
     if payload.mode == "hybrid" and knowledge_base["graph_status"] not in GRAPH_USABLE_STATUSES:
         effective_mode = "vector"
+    device_settings, _ = _device_settings_from_request(request)
+    runtime = _runtime_from_settings(device_settings)
     try:
-        result = await retrieval.search(kb_id, payload.query, effective_mode, payload.top_k)
+        result = await runtime.retrieval.search(
+            kb_id,
+            payload.query,
+            effective_mode,
+            payload.top_k,
+        )
     except AIServiceError as exc:
+        await runtime.aclose()
         raise model_error(exc) from exc
-    messages = retrieval.build_messages(
+    messages = runtime.retrieval.build_messages(
         payload.query,
         result,
         [{"role": message.role, "content": message.content} for message in payload.history],
@@ -615,11 +715,13 @@ async def chat(kb_id: str, payload: ChatRequest, request: Request) -> StreamingR
         }
         yield f"event: meta\ndata: {json.dumps(meta, ensure_ascii=False)}\n\n"
         try:
-            async for token in ai.chat_stream(messages):
+            async for token in runtime.ai.chat_stream(messages):
                 yield f"event: delta\ndata: {json.dumps({'content': token}, ensure_ascii=False)}\n\n"
             yield "event: done\ndata: {}\n\n"
         except AIServiceError as exc:
             yield f"event: error\ndata: {json.dumps({'detail': str(exc)}, ensure_ascii=False)}\n\n"
+        finally:
+            await runtime.aclose()
 
     return StreamingResponse(
         event_stream(),
@@ -642,6 +744,8 @@ async def rebuild_graph(kb_id: str, request: Request) -> dict:
     if knowledge_base["graph_status"] in {"error", "paused"}:
         db.recover_legacy_graph_timeout(kb_id)
         knowledge_base = require_knowledge_base(kb_id)
+    device_settings, _ = _device_settings_from_request(request)
+    runtime = _runtime_from_settings(device_settings)
     # Compatibility guard: old browser bundles only know /rebuild. A persisted
     # checkpoint is authoritative regardless of the legacy status value; never
     # let an old button accidentally clear partial graph data.
@@ -650,12 +754,16 @@ async def rebuild_graph(kb_id: str, request: Request) -> dict:
         if knowledge_base["graph_status"] not in {"paused", "partial"}:
             db.pause_graph_build(kb_id, "检测到未完成的构建检查点，可从当前进度继续")
             knowledge_base = require_knowledge_base(kb_id)
-        return resume_graph_from_checkpoint(kb_id, knowledge_base)
+        try:
+            return resume_graph_from_checkpoint(kb_id, knowledge_base, runtime)
+        except Exception:
+            await runtime.aclose()
+            raise
     total = int(knowledge_base["chunk_count"])
-    if settings.graph_max_chunks:
-        total = min(total, settings.graph_max_chunks)
+    if device_settings.graph_max_chunks:
+        total = min(total, device_settings.graph_max_chunks)
     db.start_graph_build(kb_id, total)
-    launch_graph_task(kb_id, resume=False)
+    launch_graph_task(kb_id, runtime, resume=False)
     return {"status": "building", "resumed": False, "stage": "queued", "current": 0, "total": total}
 
 
@@ -689,7 +797,13 @@ async def resume_graph(kb_id: str, request: Request) -> dict:
         knowledge_base = require_knowledge_base(kb_id)
     if knowledge_base["graph_status"] not in {"paused", "partial"}:
         raise HTTPException(status_code=409, detail="当前图谱任务不处于暂停状态")
-    return resume_graph_from_checkpoint(kb_id, knowledge_base)
+    device_settings, _ = _device_settings_from_request(request)
+    runtime = _runtime_from_settings(device_settings)
+    try:
+        return resume_graph_from_checkpoint(kb_id, knowledge_base, runtime)
+    except Exception:
+        await runtime.aclose()
+        raise
 
 
 @app.get("/api/knowledge-bases/{kb_id}/graph")

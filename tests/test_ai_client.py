@@ -7,6 +7,21 @@ from app.config import Settings
 from app.services.ai_client import AIClient, AIOutputTruncatedError
 
 
+def test_aihubmix_app_code_header_is_scoped_to_aihubmix_hosts():
+    primary_headers = AIClient._headers("test-key", "https://aihubmix.com/v1/chat/completions")
+    api_headers = AIClient._headers("test-key", "https://api.aihubmix.com/v1/embeddings")
+    other_headers = AIClient._headers("test-key", "https://api.openai.com/v1/chat/completions")
+    lookalike_headers = AIClient._headers(
+        "test-key",
+        "https://aihubmix.com.attacker.example/v1/chat/completions",
+    )
+
+    assert primary_headers["APP-Code"] == "YDQJ8558"
+    assert api_headers["APP-Code"] == "YDQJ8558"
+    assert "APP-Code" not in other_headers
+    assert "APP-Code" not in lookalike_headers
+
+
 @pytest.mark.asyncio
 async def test_reranker_parses_scores_and_filters_invalid_indices():
     settings = Settings(

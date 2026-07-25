@@ -41,6 +41,8 @@ export interface DocumentItem {
 }
 
 export interface PublicSettings {
+  device_settings_present: boolean;
+  settings_storage: "encrypted_device_cookie";
   embedding_base_url: string;
   embedding_model: string;
   embedding_configured: boolean;

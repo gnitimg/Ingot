@@ -10,11 +10,11 @@ from run import ensure_port_available
 
 def test_env_parser_and_configuration_check(tmp_path: Path):
     path = tmp_path / ".env"
-    path.write_text("# comment\nEMBEDDING_API_KEY=abc123\nCHAT_MODEL='model-name'\n", encoding="utf-8")
+    path.write_text("# comment\nDEVICE_COOKIE_SECRET=abc123\nCHAT_MODEL='model-name'\n", encoding="utf-8")
     assert read_env(path)["CHAT_MODEL"] == "model-name"
     assert needs_configuration(path) is False
 
-    path.write_text("EMBEDDING_API_KEY=***\n", encoding="utf-8")
+    path.write_text("DEVICE_COOKIE_SECRET=\n", encoding="utf-8")
     assert needs_configuration(path) is True
 
 
@@ -45,14 +45,14 @@ def test_env_updates_are_atomic_and_preserve_unrelated_values(tmp_path: Path):
     path.write_text("# keep this comment\nUNCHANGED=yes\nEMBEDDING_MODEL=old\n", encoding="utf-8")
 
     write_env_updates(
-        {"EMBEDDING_MODEL": "model with spaces", "EMBEDDING_API_KEY": "secret#value"},
+        {"EMBEDDING_MODEL": "model with spaces", "SAFE_VALUE": "value#with-marker"},
         path,
     )
 
     values = read_env(path)
     assert values["UNCHANGED"] == "yes"
     assert values["EMBEDDING_MODEL"] == "model with spaces"
-    assert values["EMBEDDING_API_KEY"] == "secret#value"
+    assert values["SAFE_VALUE"] == "value#with-marker"
     assert "# keep this comment" in path.read_text(encoding="utf-8")
     assert not path.with_name(".env.tmp").exists()
 

@@ -1,13 +1,10 @@
-"""Start Ingot and invoke the setup wizard when configuration is missing."""
+"""Start Ingot; model credentials are configured per browser device."""
 
 from __future__ import annotations
 
-import sys
 import socket
 
 import uvicorn
-
-from init import configure, needs_configuration
 
 
 def ensure_port_available(host: str, port: int) -> None:
@@ -22,10 +19,6 @@ def ensure_port_available(host: str, port: int) -> None:
 
 
 if __name__ == "__main__":
-    if needs_configuration():
-        if not sys.stdin.isatty():
-            raise SystemExit("EMBEDDING_API_KEY 未配置；请先在交互式终端运行 python init.py")
-        configure()
     from app.config import get_settings
 
     settings = get_settings()
